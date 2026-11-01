@@ -1,6 +1,6 @@
 {
   "name": "SuperCompara IA - Comparador de Encartes de Mercados",
-  "description": "Extrator v1.0: Motor homologado para download de 100% dos panfletos JPEG em alta resolução e extração factual precisa de produtos e preços de supermercados com IA.",
+  "description": "Módulo administrativo completo para gestão de mercados (1:N URLs), agendamento de rotinas periódicas (node-cron) e Extrator v1.0 com download e leitura factual de encartes via IA.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

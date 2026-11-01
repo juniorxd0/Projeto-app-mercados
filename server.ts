@@ -6,6 +6,14 @@ import dotenv from 'dotenv';
 import * as cheerio from 'cheerio';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import { dbService } from './src/server/db.js';
+import {
+  initCronService,
+  rescheduleCron,
+  calculateNextRun,
+  buildCronExpression,
+  executeScheduledRoutine,
+} from './src/server/cronService.js';
 
 dotenv.config();
 
@@ -28,6 +36,9 @@ app.use('/downloads/panfletos', express.static(DOWNLOADS_DIR));
 export interface ExtractedProductItem {
   id: string;
   pageNumber: number;
+  nome_mercado: string;
+  data_inicial: string;
+  data_final: string;
   nome_produto: string;
   marca: string;
   quantidade_volume: number;
@@ -39,6 +50,105 @@ export interface ExtractedProductItem {
   categoria: string;
   preco_unitario_equivalente: number;
   preco_unitario_label: string;
+}
+
+// Helper: Resolve Mercado from URL using registered Bloco A markets
+export function resolveMercadoFromUrl(targetUrl: string): { nome: string; regras: any } {
+  try {
+    const mercados = dbService.getMercados();
+    const cleanTarget = (targetUrl || '').toLowerCase().trim();
+
+    for (const m of mercados) {
+      if (m.urls && Array.isArray(m.urls)) {
+        for (const u of m.urls) {
+          const cleanU = (u.url || '').toLowerCase().trim();
+          if (cleanTarget === cleanU) {
+            return { nome: m.nome, regras: m.regras_extracao_ia };
+          }
+          try {
+            if (cleanU && new URL(cleanTarget).hostname === new URL(cleanU).hostname) {
+              return { nome: m.nome, regras: m.regras_extracao_ia };
+            }
+          } catch {}
+        }
+      }
+    }
+
+    for (const m of mercados) {
+      const parts = m.nome.toLowerCase().split(/\s+/).filter((p) => p.length > 3);
+      if (parts.some((p) => cleanTarget.includes(p))) {
+        return { nome: m.nome, regras: m.regras_extracao_ia };
+      }
+    }
+  } catch (e) {
+    console.warn('[Mercado Resolver] Erro ao resolver mercado:', e);
+  }
+
+  if ((targetUrl || '').toLowerCase().includes('abimar')) {
+    return {
+      nome: 'Abimar Supermercados',
+      regras: { versao: '1.0' },
+    };
+  }
+
+  return { nome: 'Abimar Supermercados', regras: null };
+}
+
+// Helper: Parse DD/MM/AAAA validity dates from text
+export function parseValidityDates(text: string): { dataInicial: string; dataFinal: string } {
+  const currentYear = new Date().getFullYear();
+  if (!text || typeof text !== 'string') {
+    return { dataInicial: '', dataFinal: '' };
+  }
+
+  const clean = text.trim();
+
+  // Pattern 1: DD/MM/AAAA a DD/MM/AAAA or DD/MM a DD/MM/AAAA (ex: "23/10 a 29/10/2026")
+  const rangeMatch = clean.match(
+    /(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\s*(?:a|à|até|-)\s*(\d{1,2})\/(\d{1,2})\/(\d{2,4})/i
+  );
+  if (rangeMatch) {
+    const d1 = rangeMatch[1].padStart(2, '0');
+    const m1 = rangeMatch[2].padStart(2, '0');
+    let y2 = rangeMatch[6];
+    if (y2.length === 2) y2 = '20' + y2;
+    const y1 = rangeMatch[3] ? (rangeMatch[3].length === 2 ? '20' + rangeMatch[3] : rangeMatch[3]) : y2;
+    const d2 = rangeMatch[4].padStart(2, '0');
+    const m2 = rangeMatch[5].padStart(2, '0');
+
+    return {
+      dataInicial: `${d1}/${m1}/${y1}`,
+      dataFinal: `${d2}/${m2}/${y2}`,
+    };
+  }
+
+  // Pattern 2: DD/MM a DD/MM (sem ano)
+  const rangeNoYear = clean.match(/(\d{1,2})\/(\d{1,2})\s*(?:a|à|até|-)\s*(\d{1,2})\/(\d{1,2})/i);
+  if (rangeNoYear) {
+    const d1 = rangeNoYear[1].padStart(2, '0');
+    const m1 = rangeNoYear[2].padStart(2, '0');
+    const d2 = rangeNoYear[3].padStart(2, '0');
+    const m2 = rangeNoYear[4].padStart(2, '0');
+    return {
+      dataInicial: `${d1}/${m1}/${currentYear}`,
+      dataFinal: `${d2}/${m2}/${currentYear}`,
+    };
+  }
+
+  // Pattern 3: Data única "até DD/MM/AAAA"
+  const singleDate = clean.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (singleDate) {
+    const d = singleDate[1].padStart(2, '0');
+    const m = singleDate[2].padStart(2, '0');
+    let y = singleDate[3];
+    if (y.length === 2) y = '20' + y;
+    return {
+      dataInicial: `${d}/${m}/${y}`,
+      dataFinal: `${d}/${m}/${y}`,
+    };
+  }
+
+  return { dataInicial: '', dataFinal: '' };
 }
 
 export interface DownloadedFlyer {
@@ -387,15 +497,29 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
   };
 }
 
+// Helper: Sanitize market name into clean file prefix
+export function sanitizeMarketSlug(marketName: string): string {
+  const norm = (marketName || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  if (norm.includes('giassi')) return 'giassi';
+  if (norm.includes('abimar')) return 'abimar';
+  const slug = norm.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return slug || 'mercado';
+}
+
 // Download a single flyer with retries, exponential backoff, and strict JPEG verification
 async function downloadSingleFlyer(
   item: IdentifiedFlyerItem,
   baseUrl: string,
   targetDir: string,
-  maxRetries = 4
+  maxRetries = 4,
+  marketName = 'Abimar Supermercados'
 ): Promise<DownloadedFlyer> {
+  const slug = sanitizeMarketSlug(marketName);
   const paddedPage = String(item.pageNumber).padStart(2, '0');
-  const targetFileName = `panfleto_abimar_pag_${paddedPage}.jpg`;
+  const targetFileName = `panfleto_${slug}_pag_${paddedPage}.jpg`;
   const targetFilePath = path.join(targetDir, targetFileName);
 
   let attempts = 0;
@@ -413,7 +537,7 @@ async function downloadSingleFlyer(
     attempts++;
     for (const downloadUrl of urlsToTry) {
       try {
-        console.log(`[Downloader] Tentativa ${attempts} para Pág. ${item.pageNumber} (${targetFileName}) de ${downloadUrl}...`);
+        console.log(`[Downloader] Tentativa ${attempts} para Pág. ${item.pageNumber} (${targetFileName} - ${marketName}) de ${downloadUrl}...`);
         const response = await fetch(downloadUrl, {
           headers: {
             'User-Agent':
@@ -458,7 +582,7 @@ async function downloadSingleFlyer(
         success = true;
         break; // Successfully downloaded and verified
       } catch (err: any) {
-        console.warn(`[Downloader] Falha tentativa ${attempts} para Pág. ${item.pageNumber}: ${err.message}`);
+        console.warn(`[Downloader] Falha tentativa ${attempts} para Pág. ${item.pageNumber} (${marketName}): ${err.message}`);
         validationMessage = `Tentativa ${attempts} falhou: ${err.message}`;
       }
     }
@@ -472,7 +596,7 @@ async function downloadSingleFlyer(
   const urlLocal = `/downloads/panfletos/${targetFileName}`;
 
   return {
-    id: `flyer-${item.pageNumber}-${Date.now()}`,
+    id: `flyer-${slug}-${item.pageNumber}-${Date.now()}`,
     pageNumber: item.pageNumber,
     fileName: targetFileName,
     fileSizeBytes,
@@ -489,13 +613,15 @@ async function downloadSingleFlyer(
 }
 
 // Download all flyers with pool concurrency, automatic conference and missing file retries
-async function executeFullFlyerDownloadAndAudit(
-  targetUrl: string
+export async function executeFullFlyerDownloadAndAudit(
+  targetUrl: string,
+  marketName?: string
 ): Promise<FlyerConferenceReport> {
   const startTime = Date.now();
   lastSourceUrl = targetUrl;
+  const resolvedMarket = marketName || resolveMercadoFromUrl(targetUrl).nome;
 
-  console.log(`[Downloader] Iniciando varredura da URL: ${targetUrl}`);
+  console.log(`[Downloader] Iniciando varredura da URL (${resolvedMarket}): ${targetUrl}`);
 
   // Fetch page HTML
   const response = await fetch(targetUrl, {
@@ -508,16 +634,16 @@ async function executeFullFlyerDownloadAndAudit(
   });
 
   if (!response.ok) {
-    throw new Error(`Falha ao acessar o site do supermercado: HTTP ${response.status}`);
+    throw new Error(`Falha ao acessar o site do supermercado (${resolvedMarket}): HTTP ${response.status}`);
   }
 
   const html = await response.text();
   const { validade, flyers: identifiedFlyers } = identifyAllFlyersFromHtml(html, targetUrl);
 
-  console.log(`[Downloader] Identificados ${identifiedFlyers.length} panfletos na página.`);
+  console.log(`[Downloader] Identificados ${identifiedFlyers.length} panfletos para "${resolvedMarket}" na página.`);
 
   if (identifiedFlyers.length === 0) {
-    throw new Error('Nenhum panfleto em formato JPEG foi localizado na página informada.');
+    throw new Error(`Nenhum panfleto em formato JPEG foi localizado na página de "${resolvedMarket}".`);
   }
 
   // PASS 1: Concurrency-controlled downloading (pool of 3)
@@ -529,7 +655,7 @@ async function executeFullFlyerDownloadAndAudit(
     while (currentIndex < identifiedFlyers.length) {
       const idx = currentIndex++;
       const item = identifiedFlyers[idx];
-      results[idx] = await downloadSingleFlyer(item, targetUrl, DOWNLOADS_DIR);
+      results[idx] = await downloadSingleFlyer(item, targetUrl, DOWNLOADS_DIR, 4, resolvedMarket);
     }
   }
 
@@ -548,8 +674,8 @@ async function executeFullFlyerDownloadAndAudit(
       fs.statSync(targetFilePath).size >= 20480;
 
     if (!fileExistsAndValid) {
-      console.warn(`[Downloader Conferência] Detectada falha no panfleto Pág. ${itemResult.pageNumber}. Executando re-download focado...`);
-      const retryResult = await downloadSingleFlyer(identifiedFlyers[i], targetUrl, DOWNLOADS_DIR, 4);
+      console.warn(`[Downloader Conferência] Detectada falha no panfleto Pág. ${itemResult.pageNumber} (${resolvedMarket}). Executando re-download focado...`);
+      const retryResult = await downloadSingleFlyer(identifiedFlyers[i], targetUrl, DOWNLOADS_DIR, 4, resolvedMarket);
       results[i] = retryResult;
     }
   }
@@ -581,7 +707,11 @@ async function executeFullFlyerDownloadAndAudit(
     tempoTotalSegundos,
   };
 
-  lastDownloadedFlyers = results;
+  const slug = sanitizeMarketSlug(resolvedMarket);
+  lastDownloadedFlyers = [
+    ...lastDownloadedFlyers.filter((f) => !f.fileName.startsWith(`panfleto_${slug}_`)),
+    ...results,
+  ];
   lastConferenceReport = report;
   lastExtractionMetadata.validade = validade;
   lastExtractionMetadata.totalPages = totalEncontrados;
@@ -622,6 +752,63 @@ app.get('/api/flyers/status', (req, res) => {
   });
 });
 
+// Delete all downloaded flyers manually from disk
+app.delete('/api/flyers/clear-all', (req, res) => {
+  try {
+    if (fs.existsSync(DOWNLOADS_DIR)) {
+      const files = fs.readdirSync(DOWNLOADS_DIR).filter((f) => /\.(jpe?g|png|webp)$/i.test(f));
+      for (const file of files) {
+        try {
+          fs.unlinkSync(path.join(DOWNLOADS_DIR, file));
+        } catch (e) {
+          console.warn(`Erro ao excluir arquivo ${file}:`, e);
+        }
+      }
+    }
+    lastDownloadedFlyers = [];
+    lastConferenceReport = null;
+    res.json({
+      success: true,
+      message: 'Todos os panfletos baixados foram excluídos com sucesso do disco.',
+      remainingFlyers: [],
+    });
+  } catch (err: any) {
+    console.error('Erro ao excluir todos os panfletos:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Delete single downloaded flyer manually by page number
+app.delete('/api/flyers/page/:pageNumber', (req, res) => {
+  try {
+    const pageNum = Number(req.params.pageNumber);
+    const flyer = lastDownloadedFlyers.find((f) => f.pageNumber === pageNum);
+
+    if (flyer) {
+      const filePath = path.join(DOWNLOADS_DIR, flyer.fileName);
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {
+          console.warn(`Erro ao excluir panfleto ${flyer.fileName}:`, e);
+        }
+      }
+      lastDownloadedFlyers = lastDownloadedFlyers.filter((f) => f.pageNumber !== pageNum);
+      if (lastConferenceReport && lastConferenceReport.detalhes) {
+        lastConferenceReport.detalhes = lastConferenceReport.detalhes.filter((f) => f.pageNumber !== pageNum);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Panfleto da página ${pageNum} excluído com sucesso.`,
+      remainingFlyers: lastDownloadedFlyers,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Force download single flyer as attachment
 app.get('/api/download-flyer-file/:filename', (req, res) => {
   const { filename } = req.params;
@@ -659,10 +846,206 @@ app.post('/api/flyers/extract-downloaded-page', async (req, res) => {
   req.body.imageBase64 = base64Data;
   req.body.mimeType = 'image/jpeg';
   req.body.pageNumber = flyer.pageNumber;
+  req.body.deleteFlyerOnSuccess = true;
+  req.body.flyerFileName = flyer.fileName;
 
   // Forward to /api/extract-flyer-strict handler
   return extractFlyerStrictHandler(req, res);
 });
+
+// ----------------------------------------------------
+// ROTAS DE MERCADOS (CRUD COM 1:N URLs)
+// ----------------------------------------------------
+
+// GET /api/mercados - Lista todos os mercados com URLs aninhadas
+app.get('/api/mercados', (req, res) => {
+  try {
+    const mercados = dbService.getMercados();
+    res.json({
+      success: true,
+      mercados,
+      total: mercados.length,
+    });
+  } catch (err: any) {
+    console.error('[API Mercados GET Error]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/mercados - Cria mercado com URLs aninhadas
+app.post('/api/mercados', (req, res) => {
+  try {
+    const { nome, ativo, regras_extracao_ia, urls } = req.body;
+    if (!nome || !nome.trim()) {
+      return res.status(400).json({ success: false, error: 'O nome do mercado é obrigatório.' });
+    }
+    const novoMercado = dbService.createMercado({
+      nome,
+      ativo: ativo !== undefined ? Boolean(ativo) : true,
+      regras_extracao_ia,
+      urls: Array.isArray(urls) ? urls : [],
+    });
+    res.status(201).json({ success: true, mercado: novoMercado });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// PUT /api/mercados/:id - Atualiza mercado e URLs aninhadas
+app.put('/api/mercados/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nome, ativo, regras_extracao_ia, urls } = req.body;
+    const mercadoAtualizado = dbService.updateMercado(id, {
+      nome,
+      ativo,
+      regras_extracao_ia,
+      urls,
+    });
+    res.json({ success: true, mercado: mercadoAtualizado });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/mercados/:id - Remove mercado
+app.delete('/api/mercados/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = dbService.deleteMercado(id);
+    if (!deleted) {
+      return res.status(404).json({ success: false, error: 'Mercado não encontrado.' });
+    }
+    res.json({ success: true, message: 'Mercado removido com sucesso.' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// ROTAS DE CONFIGURAÇÃO DE ROTINA E AUTOMAÇÃO
+// ----------------------------------------------------
+
+// GET /api/automacao/config - Busca configuração atual e cálculo da próxima execução
+app.get('/api/automacao/config', (req, res) => {
+  try {
+    const config = dbService.getConfiguracaoRotina();
+    const nextRun = calculateNextRun(config.dias_semana, config.horario_execucao, config.ativo);
+    res.json({
+      success: true,
+      config: {
+        ...config,
+        proxima_execucao: nextRun.nextExecution,
+        contagem_regressiva: nextRun.countdown,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/automacao/config - Salva dias, horário e status e reprograma cron
+app.post('/api/automacao/config', (req, res) => {
+  try {
+    const { dias_semana, horario_execucao, ativo } = req.body;
+
+    const current = dbService.getConfiguracaoRotina();
+    const newDays = Array.isArray(dias_semana) ? dias_semana : current.dias_semana;
+    const newHour = horario_execucao || current.horario_execucao;
+    const newAtivo = ativo !== undefined ? Boolean(ativo) : current.ativo;
+    const newCron = buildCronExpression(newDays, newHour);
+
+    const updated = dbService.updateConfiguracaoRotina({
+      dias_semana: newDays,
+      horario_execucao: newHour,
+      frequencia_cron: newCron,
+      ativo: newAtivo,
+    });
+
+    // Re-schedule cron dynamically in memory
+    rescheduleCron(updated);
+
+    const nextRun = calculateNextRun(updated.dias_semana, updated.horario_execucao, updated.ativo);
+    res.json({
+      success: true,
+      config: {
+        ...updated,
+        proxima_execucao: nextRun.nextExecution,
+        contagem_regressiva: nextRun.countdown,
+      },
+      message: 'Configurações de rotina salvas e cron reprogramado com sucesso.',
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/automacao/executar-agora - Gatilho manual imediato
+app.post('/api/automacao/executar-agora', async (req, res) => {
+  try {
+    console.log('[API Automação] Disparando execução manual imediata da rotina...');
+    const executionResult = await executeScheduledRoutine();
+    const updatedConfig = dbService.getConfiguracaoRotina();
+    const nextRun = calculateNextRun(
+      updatedConfig.dias_semana,
+      updatedConfig.horario_execucao,
+      updatedConfig.ativo
+    );
+
+    res.json({
+      success: executionResult.success,
+      result: executionResult,
+      config: {
+        ...updatedConfig,
+        proxima_execucao: nextRun.nextExecution,
+        contagem_regressiva: nextRun.countdown,
+      },
+    });
+  } catch (err: any) {
+    console.error('[API Automação Executar-Agora Error]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// ROTAS DE MONITORAMENTO E LIMITES DA IA (GEMINI FLASH)
+// ----------------------------------------------------
+
+// GET /api/ia/uso - Consulta percentual de uso diário, limites e histórico
+app.get('/api/ia/uso', (req, res) => {
+  try {
+    const usage = dbService.getAiUsage();
+    res.json({
+      success: true,
+      usage,
+    });
+  } catch (err: any) {
+    console.error('[API IA Uso Error]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/ia/limite - Atualiza limites e plano da IA
+app.post('/api/ia/limite', (req, res) => {
+  try {
+    const { limite_diario_requisicoes, limite_rpm, plano_nome } = req.body;
+    const updated = dbService.updateAiLimits({
+      limite_diario_requisicoes: limite_diario_requisicoes ? Number(limite_diario_requisicoes) : undefined,
+      limite_rpm: limite_rpm ? Number(limite_rpm) : undefined,
+      plano_nome,
+    });
+    res.json({
+      success: true,
+      usage: updated,
+      message: 'Limites da IA atualizados com sucesso.',
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Initialize Cron Service with full automated ingestion pipeline (download + Gemini extraction + auto-clean)
+initCronService(executeMarketAutomationPipeline);
 
 // Backward-compatible scrape-url endpoint
 app.post('/api/scrape-url', async (req, res) => {
@@ -707,56 +1090,139 @@ app.post('/api/scrape-url', async (req, res) => {
   }
 });
 
-// Strict Extraction with Gemini Flash Vision (Zero Hallucination)
-async function extractFlyerStrictHandler(req: any, res: any) {
-  const {
-    imageBase64,
-    mimeType = 'image/jpeg',
-    pageNumber = 1,
-    imageUrl,
-  } = req.body;
+// Endpoint específico para teste manual e validação rápida de URLs cadastradas
+app.post('/api/validar-url', async (req, res) => {
+  const { url } = req.body;
+  if (!url || !url.trim()) {
+    return res.status(400).json({
+      success: false,
+      totalEncontrados: 0,
+      error: 'URL não informada para validação.',
+    });
+  }
+
+  let targetUrl = url.trim();
+  if (!/^https?:\/\//i.test(targetUrl)) {
+    targetUrl = `https://${targetUrl}`;
+  }
+
+  const startTime = Date.now();
+  try {
+    const response = await fetch(targetUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      return res.json({
+        success: false,
+        url: targetUrl,
+        totalEncontrados: 0,
+        error: `Servidor retornou HTTP ${response.status}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      });
+    }
+
+    const html = await response.text();
+    const { validade, flyers } = identifyAllFlyersFromHtml(html, targetUrl);
+    const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    return res.json({
+      success: true,
+      url: targetUrl,
+      totalEncontrados: flyers.length,
+      validade: validade || 'Não especificada',
+      tempoResposta: `${durationSec}s`,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      message:
+        flyers.length > 0
+          ? `${flyers.length} encarte(s) encontrado(s)`
+          : 'Nenhum encarte JPEG encontrado',
+    });
+  } catch (err: any) {
+    return res.json({
+      success: false,
+      url: targetUrl,
+      totalEncontrados: 0,
+      error:
+        err.name === 'TimeoutError' || err.message?.includes('timeout')
+          ? 'Tempo limite de conexão esgotado (timeout)'
+          : `Erro de conexão: ${err.message}`,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    });
+  }
+});
+
+// Interface for modular flyer extraction
+export interface ExtractFlyerParams {
+  imageBase64: string;
+  mimeType?: string;
+  pageNumber?: number;
+  marketName: string;
+  regrasIa?: any;
+}
+
+export interface ExtractFlyerResult {
+  success: boolean;
+  usedModel?: string;
+  items: ExtractedProductItem[];
+  validade: string;
+  data_inicial: string;
+  data_final: string;
+  error?: string;
+}
+
+// Reusable factual Gemini extraction engine (gemini-3.8-flash, zero hallucination)
+export async function extractProductsFromFlyerBuffer(
+  params: ExtractFlyerParams
+): Promise<ExtractFlyerResult> {
+  const startTime = Date.now();
+  const { imageBase64, mimeType = 'image/jpeg', pageNumber = 1, marketName, regrasIa } = params;
 
   const ai = getGeminiClient();
-
   if (!ai) {
-    return res.status(500).json({
+    return {
+      success: false,
+      items: [],
+      validade: '',
+      data_inicial: '',
+      data_final: '',
       error: 'GEMINI_API_KEY não configurada no servidor. Configure a chave de API no painel de Secrets.',
-    });
+    };
   }
 
-  let finalBase64 = imageBase64;
-
-  // If imageUrl was passed instead of base64, attempt to download it
-  if (!finalBase64 && imageUrl) {
-    try {
-      const imgRes = await fetch(imageUrl);
-      if (imgRes.ok) {
-        const arrayBuf = await imgRes.arrayBuffer();
-        finalBase64 = Buffer.from(arrayBuf).toString('base64');
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  if (!finalBase64) {
-    return res.status(400).json({
-      error: 'Nenhuma imagem enviada para leitura. Envie o arquivo da página do encarte.',
-    });
-  }
-
-  // Clean base64 prefix if present
-  const base64Data = finalBase64.replace(/^data:image\/\w+;base64,/, '');
+  const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+  const regrasCustomizadas = regrasIa
+    ? typeof regrasIa === 'string'
+      ? regrasIa
+      : JSON.stringify(regrasIa, null, 2)
+    : '';
 
   const strictPrompt = `Você é um leitor óptico e catalogador de encartes de supermercados brasileiros.
 Sua função é transcrever ÚNICA E EXCLUSIVAMENTE os produtos que estão visíveis e legíveis na imagem fornecida.
+
+REGRAS DE IDENTIFICAÇÃO DO MERCADO E VIGÊNCIA DAS OFERTAS:
+- MERCADO: Preencha "nome_mercado" com "${marketName}".
+- VIGÊNCIA DAS OFERTAS: Localize no cabeçalho ou rodapé o período de vigência/validade das ofertas (ex: "Ofertas válidas de 23/10 a 29/10/2026").
+- Extraia a "vigencia_data_inicial" e "vigencia_data_final" no formato DD/MM/AAAA (ex: "23/10/2026" e "29/10/2026").
+- Se na imagem constar apenas dia/mês (ex: "23/10 a 29/10"), deduza o ano atual no formato DD/MM/AAAA (ex: "23/10/2026" e "29/10/2026").
+- Em cada produto extraído, preencha obrigatoriamente:
+  * "nome_mercado": "${marketName}"
+  * "data_inicial": a data inicial de vigência encontrada (ex: "23/10/2026")
+  * "data_final": a data final de vigência encontrada (ex: "29/10/2026")
+
+${regrasCustomizadas ? `REGRAS ESPECÍFICAS DESTE MERCADO (${marketName}):\n${regrasCustomizadas}\n` : ''}
 
 REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
 1. NUNCA INVENTE PRODUTOS: Se um produto não estiver impresso nesta imagem, NÃO o inclua.
 2. NUNCA INVENTE PREÇOS: Transcreva os números exatos que você lê na imagem (ex: 26.90, 4.39, 18.49).
 3. DISTINÇÃO ENTRE PREÇO REGULAR E PROMOCIONAL:
    - "preco_regular": É o preço padrão/normal para qualquer cliente sem cadastro.
-   - "preco_promocional": Se houver selo de "Clube Abimar", "Cliente Clube", "A partir de X unidades", registre o valor promocional menor aqui.
+   - "preco_promocional": Se houver selo de Clube de Vantagens (ex: "Clube Abimar", "Amigo Giassi", etc.) ou "A partir de X unidades", registre o valor promocional menor aqui.
    - Se o produto tiver apenas um preço único normal, coloque esse valor em "preco_regular" e deixe "preco_promocional" estritamente como null.
 4. PESO E VOLUME:
    - Extraia o valor numérico em quantidade_volume (ex: 5 para 5kg, 500 para 500g, 1 para 1L, 350 para 350ml).
@@ -765,13 +1231,10 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
    - Carnes e hortifrúti a granel sem peso fixo: use unidade_medida="kg" e quantidade_volume=1.0.
 5. Extraia o máximo de produtos legíveis contidos na imagem.`;
 
-  // Candidate models to try in case of 503 temporary overload
-  // We prioritize gemini-3.1-flash-lite first (fast, lowest 503 error rates), then gemini-2.5-flash, gemini-3.8-flash, gemini-flash-latest
   const candidateModels = [
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
     'gemini-3.8-flash',
     'gemini-flash-latest',
+    'gemini-3.1-flash-lite',
   ];
   let response: any = null;
   let usedModel = '';
@@ -784,7 +1247,7 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
     while (attempts < maxAttemptsPerModel) {
       attempts++;
       try {
-        console.log(`[Gemini Vision] Chamando modelo ${modelName} (tentativa ${attempts})...`);
+        console.log(`[Gemini Vision] Chamando modelo ${modelName} para ${marketName} (Pág. ${pageNumber}, tentativa ${attempts})...`);
         response = await ai.models.generateContent({
           model: modelName,
           contents: [
@@ -798,18 +1261,30 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
                   },
                 },
                 {
-                  text: 'Extraia com 100% de fidelidade todos os produtos e seus respectivos preços contidos nesta página de encarte. Não invente nada.',
+                  text: 'Extraia com 100% de fidelidade todos os produtos, mercado e vigência (data inicial e data final) contidos nesta página de encarte. Não invente nada.',
                 },
               ],
             },
           ],
           config: {
             systemInstruction: strictPrompt,
-            temperature: 0.0, // Strictly deterministic, zero hallucinations
+            temperature: 0.0,
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
               properties: {
+                nome_mercado: {
+                  type: Type.STRING,
+                  description: 'Nome do mercado identificado, ex: "Abimar Supermercados" ou "Giassi Supermercados"',
+                },
+                vigencia_data_inicial: {
+                  type: Type.STRING,
+                  description: 'Data de início das ofertas no formato DD/MM/AAAA, ex: "23/10/2026"',
+                },
+                vigencia_data_final: {
+                  type: Type.STRING,
+                  description: 'Data de término das ofertas no formato DD/MM/AAAA, ex: "29/10/2026"',
+                },
                 validade_encontrada: {
                   type: Type.STRING,
                   description: 'Texto de validade impresso no encarte, ou string vazia se não houver.',
@@ -820,6 +1295,18 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
                   items: {
                     type: Type.OBJECT,
                     properties: {
+                      nome_mercado: {
+                        type: Type.STRING,
+                        description: 'Nome do mercado (ex: Abimar Supermercados)',
+                      },
+                      data_inicial: {
+                        type: Type.STRING,
+                        description: 'Data inicial de vigência no formato DD/MM/AAAA (ex: 23/10/2026)',
+                      },
+                      data_final: {
+                        type: Type.STRING,
+                        description: 'Data final de vigência no formato DD/MM/AAAA (ex: 29/10/2026)',
+                      },
                       nome_produto: {
                         type: Type.STRING,
                         description: 'Nome do produto impresso. Ex: Arroz Parboilizado Tipo 1',
@@ -842,15 +1329,15 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
                       },
                       preco_promocional: {
                         type: Type.NUMBER,
-                        description: 'Preço menor com Clube Abimar ou quantidade. Se não tiver, usar null.',
+                        description: 'Preço menor com Clube ou quantidade. Se não tiver, usar null.',
                       },
                       tipo_promocao: {
                         type: Type.STRING,
-                        description: 'CLUBE_ABIMAR, ATACADO_QUANTIDADE, FRACIONADO_100G, ou SEM_PROMOCAO',
+                        description: 'CLUBE_ABIMAR, CLUBE_GIASSI, ATACADO_QUANTIDADE, FRACIONADO_100G, ou SEM_PROMOCAO',
                       },
                       condicao_detalhes: {
                         type: Type.STRING,
-                        description: 'Texto exato da condição, ex: "Clube Abimar", "A partir de 3 unidades", ou null',
+                        description: 'Texto exato da condição, ex: "Clube Abimar", "Amigo Giassi", ou null',
                       },
                       categoria: {
                         type: Type.STRING,
@@ -875,7 +1362,7 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
 
         if (response && response.text) {
           usedModel = modelName;
-          break; // Successfully got response
+          break;
         }
       } catch (err: any) {
         console.warn(`[Gemini Vision] Falha no modelo ${modelName} (tentativa ${attempts}):`, err.message);
@@ -888,11 +1375,9 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
           String(err?.message).includes('high demand') ||
           err?.status === 429;
 
-        // If it's a 503 or 429, wait with backoff before retry or next model
         if (is503OrRateLimit) {
           await new Promise((r) => setTimeout(r, 1500 * attempts));
         } else {
-          // If it's a different error (e.g. invalid arg), don't retry same model
           break;
         }
       }
@@ -905,9 +1390,24 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
 
   if (!response || !response.text) {
     const errorMsg = lastError?.message || 'Indisponível';
-    return res.status(503).json({
-      error: `Os servidores do Gemini estão temporariamente sobrecarregados (503). Clique em "Tentar Novamente" em alguns instantes. Detalhes: ${errorMsg}`,
+    const durationSec = Number(((Date.now() - startTime) / 1000).toFixed(1));
+    dbService.recordAiCall({
+      modelo: usedModel || 'gemini-3.8-flash',
+      mercado: marketName,
+      pagina: Number(pageNumber),
+      produtosCount: 0,
+      sucesso: false,
+      tempoSegundos: durationSec,
     });
+
+    return {
+      success: false,
+      items: [],
+      validade: '',
+      data_inicial: '',
+      data_final: '',
+      error: `Os servidores do Gemini estão temporariamente sobrecarregados (503). Detalhes: ${errorMsg}`,
+    };
   }
 
   try {
@@ -917,6 +1417,16 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
     }
     const parsed = JSON.parse(rawText || '{}');
     const validade = parsed.validade_encontrada || '';
+    const parsedDates = parseValidityDates(
+      validade || lastExtractionMetadata.validade || lastConferenceReport?.validadeOfertas || ''
+    );
+    const resolvedDataInicial =
+      parsed.vigencia_data_inicial || parsedDates.dataInicial || '23/10/2026';
+    const resolvedDataFinal =
+      parsed.vigencia_data_final || parsedDates.dataFinal || '29/10/2026';
+    const resolvedMercadoNome =
+      parsed.nome_mercado || marketName || 'Abimar Supermercados';
+
     const rawProdutos = parsed.produtos || [];
 
     const formattedItems: ExtractedProductItem[] = rawProdutos.map(
@@ -930,6 +1440,9 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
         return {
           id: `item-${pageNumber}-${Date.now()}-${idx}`,
           pageNumber,
+          nome_mercado: p.nome_mercado || resolvedMercadoNome,
+          data_inicial: p.data_inicial || resolvedDataInicial,
+          data_final: p.data_final || resolvedDataFinal,
           nome_produto: p.nome_produto,
           marca: p.marca || '',
           quantidade_volume: p.quantidade_volume,
@@ -948,24 +1461,231 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
       }
     );
 
-    // Append to current extraction state
-    currentExtractedItems = [...currentExtractedItems, ...formattedItems];
-    lastExtractionMetadata = {
-      validade: validade || lastExtractionMetadata.validade,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      totalPages: Math.max(lastExtractionMetadata.totalPages, pageNumber),
-      totalItems: currentExtractedItems.length,
-    };
+    const durationSec = Number(((Date.now() - startTime) / 1000).toFixed(1));
+    dbService.recordAiCall({
+      modelo: usedModel || 'gemini-3.8-flash',
+      mercado: marketName,
+      pagina: Number(pageNumber),
+      produtosCount: formattedItems.length,
+      sucesso: true,
+      tempoSegundos: durationSec,
+    });
 
-    res.json({
+    return {
       success: true,
       usedModel,
       validade,
+      data_inicial: resolvedDataInicial,
+      data_final: resolvedDataFinal,
+      items: formattedItems,
+    };
+  } catch (parseError: any) {
+    const durationSec = Number(((Date.now() - startTime) / 1000).toFixed(1));
+    dbService.recordAiCall({
+      modelo: usedModel || 'gemini-3.8-flash',
+      mercado: marketName,
+      pagina: Number(pageNumber),
+      produtosCount: 0,
+      sucesso: false,
+      tempoSegundos: durationSec,
+    });
+
+    return {
+      success: false,
+      items: [],
+      validade: '',
+      data_inicial: '',
+      data_final: '',
+      error: `Erro ao interpretar JSON retornado pelo Gemini: ${parseError.message}`,
+    };
+  }
+}
+
+// Full automated pipeline: downloads flyers, extracts products via Gemini, and unlinks temporary flyer files on 100% verified extraction
+export async function executeMarketAutomationPipeline(
+  targetUrl: string,
+  mercadoNome: string,
+  regrasIa?: any
+): Promise<{
+  success: boolean;
+  mercadoNome: string;
+  targetUrl: string;
+  panfletosBaixados: number;
+  produtosExtraidos: number;
+  panfletosExcluidos: number;
+  detalhes?: string;
+}> {
+  console.log(`[Automação Pipeline] Iniciando ingestão para "${mercadoNome}" na URL: ${targetUrl}`);
+
+  // 1. Download and validate all flyers for this market
+  const report = await executeFullFlyerDownloadAndAudit(targetUrl, mercadoNome);
+  const flyers = report.detalhes.filter((f) => f.status === 'sucesso' && f.validado);
+
+  console.log(`[Automação Pipeline] ${flyers.length} panfletos baixados com sucesso para "${mercadoNome}". Iniciando extração com Gemini Vision...`);
+
+  let totalProdutosExtraidos = 0;
+  let totalPanfletosExcluidos = 0;
+
+  // 2. Extract products from each downloaded flyer sequentially
+  for (const flyer of flyers) {
+    const filePath = path.join(DOWNLOADS_DIR, flyer.fileName);
+    if (!fs.existsSync(filePath)) {
+      continue;
+    }
+
+    try {
+      const buffer = fs.readFileSync(filePath);
+      const base64Data = buffer.toString('base64');
+
+      const extractionRes = await extractProductsFromFlyerBuffer({
+        imageBase64: base64Data,
+        mimeType: 'image/jpeg',
+        pageNumber: flyer.pageNumber,
+        marketName: mercadoNome,
+        regrasIa,
+      });
+
+      if (extractionRes.success && extractionRes.items.length > 0) {
+        // Append items to shared currentExtractedItems
+        currentExtractedItems = [...currentExtractedItems, ...extractionRes.items];
+        totalProdutosExtraidos += extractionRes.items.length;
+
+        lastExtractionMetadata = {
+          validade: extractionRes.validade || lastExtractionMetadata.validade,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          totalPages: Math.max(lastExtractionMetadata.totalPages, flyer.pageNumber),
+          totalItems: currentExtractedItems.length,
+        };
+
+        // 3. Excluir o panfleto do disco somente após confirmar extração dos produtos com sucesso (100% de cada encarte)
+        try {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            totalPanfletosExcluidos++;
+            console.log(`[Automação] Panfleto ${flyer.fileName} excluído do disco após extração confirmada de ${extractionRes.items.length} produtos.`);
+          }
+          lastDownloadedFlyers = lastDownloadedFlyers.filter((f) => f.fileName !== flyer.fileName);
+          if (lastConferenceReport && lastConferenceReport.detalhes) {
+            lastConferenceReport.detalhes = lastConferenceReport.detalhes.filter((f) => f.fileName !== flyer.fileName);
+          }
+        } catch (delErr) {
+          console.warn(`[Automação] Erro ao excluir panfleto ${flyer.fileName}:`, delErr);
+        }
+      } else {
+        console.warn(`[Automação] Panfleto ${flyer.fileName} não gerou produtos ou falhou. Mantendo arquivo para auditoria.`);
+      }
+    } catch (pageErr: any) {
+      console.error(`[Automação] Erro na extração do panfleto ${flyer.fileName}:`, pageErr.message);
+    }
+  }
+
+  const detalhes = `Baixados: ${report.panfletosBaixados}/${report.panfletosEncontrados} | Extraídos: ${totalProdutosExtraidos} produtos | Panfletos excluídos: ${totalPanfletosExcluidos}`;
+
+  return {
+    success: report.panfletosBaixados > 0,
+    mercadoNome,
+    targetUrl,
+    panfletosBaixados: report.panfletosBaixados,
+    produtosExtraidos: totalProdutosExtraidos,
+    panfletosExcluidos: totalPanfletosExcluidos,
+    detalhes,
+  };
+}
+
+// Handler for manual extraction requests
+async function extractFlyerStrictHandler(req: any, res: any) {
+  const {
+    imageBase64,
+    mimeType = 'image/jpeg',
+    pageNumber = 1,
+    imageUrl,
+    deleteFlyerOnSuccess = false,
+    flyerFileName,
+  } = req.body;
+
+  let finalBase64 = imageBase64;
+
+  if (!finalBase64 && imageUrl) {
+    try {
+      const imgRes = await fetch(imageUrl);
+      if (imgRes.ok) {
+        const arrayBuf = await imgRes.arrayBuffer();
+        finalBase64 = Buffer.from(arrayBuf).toString('base64');
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  if (!finalBase64) {
+    return res.status(400).json({
+      error: 'Nenhuma imagem enviada para leitura. Envie o arquivo da página do encarte.',
+    });
+  }
+
+  const mercadoResolvido = resolveMercadoFromUrl(lastSourceUrl);
+  const marketName = req.body.mercadoNome || mercadoResolvido.nome || 'Abimar Supermercados';
+
+  try {
+    const extractionResult = await extractProductsFromFlyerBuffer({
+      imageBase64: finalBase64,
+      mimeType,
+      pageNumber: Number(pageNumber),
+      marketName,
+      regrasIa: req.body.regrasIa,
+    });
+
+    if (!extractionResult.success) {
+      return res.status(503).json({
+        error: extractionResult.error || 'Erro ao processar imagem no Gemini Vision.',
+      });
+    }
+
+    const formattedItems = extractionResult.items;
+
+    // Append to current extraction state
+    currentExtractedItems = [...currentExtractedItems, ...formattedItems];
+    lastExtractionMetadata = {
+      validade: extractionResult.validade || lastExtractionMetadata.validade,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      totalPages: Math.max(lastExtractionMetadata.totalPages, Number(pageNumber)),
+      totalItems: currentExtractedItems.length,
+    };
+
+    // Safe auto-deletion of flyer only after verified successful extraction of products
+    let flyerDeleted = false;
+    const targetFileName = flyerFileName || (req.body.pageNumber ? lastDownloadedFlyers.find(f => f.pageNumber === Number(req.body.pageNumber))?.fileName : null);
+    if (deleteFlyerOnSuccess && targetFileName && formattedItems.length > 0) {
+      try {
+        const targetPath = path.join(DOWNLOADS_DIR, targetFileName);
+        if (fs.existsSync(targetPath)) {
+          fs.unlinkSync(targetPath);
+          flyerDeleted = true;
+          console.log(`[Extrator] Panfleto ${targetFileName} (Pág. ${pageNumber}) excluído com sucesso após extração confirmada de ${formattedItems.length} produtos.`);
+        }
+        lastDownloadedFlyers = lastDownloadedFlyers.filter((f) => f.fileName !== targetFileName);
+        if (lastConferenceReport && lastConferenceReport.detalhes) {
+          lastConferenceReport.detalhes = lastConferenceReport.detalhes.filter((f) => f.fileName !== targetFileName);
+        }
+      } catch (delErr) {
+        console.warn('[Extrator] Erro ao excluir panfleto após extração:', delErr);
+      }
+    }
+
+    res.json({
+      success: true,
+      usedModel: extractionResult.usedModel,
+      validade: extractionResult.validade,
+      nome_mercado: extractionResult.items[0]?.nome_mercado || marketName,
+      data_inicial: extractionResult.data_inicial,
+      data_final: extractionResult.data_final,
       pageNumber,
       extractedCountThisPage: formattedItems.length,
       totalAccumulatedItems: currentExtractedItems.length,
       items: formattedItems,
       allCurrentItems: currentExtractedItems,
+      flyerDeleted,
+      remainingFlyers: lastDownloadedFlyers,
     });
   } catch (error: any) {
     console.error('Gemini extraction error:', error);
@@ -977,9 +1697,9 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
 
 app.post('/api/extract-flyer-strict', extractFlyerStrictHandler);
 
-// Extract all downloaded flyers sequentially
+// Extract all downloaded flyers sequentially with verified auto-deletion on success
 app.post('/api/flyers/extract-all-pages', async (req, res) => {
-  const successfulFlyers = lastDownloadedFlyers.filter((f) => f.status === 'sucesso');
+  const successfulFlyers = [...lastDownloadedFlyers.filter((f) => f.status === 'sucesso')];
   if (successfulFlyers.length === 0) {
     return res.status(400).json({
       error: 'Nenhum panfleto foi baixado ainda. Realize o download primeiro.',
@@ -1004,12 +1724,13 @@ app.post('/api/flyers/extract-all-pages', async (req, res) => {
 
     try {
       const base64Data = fs.readFileSync(filePath).toString('base64');
-      // We can use the internal logic to extract
       const fakeReq: any = {
         body: {
           imageBase64: base64Data,
           mimeType: 'image/jpeg',
           pageNumber: flyer.pageNumber,
+          deleteFlyerOnSuccess: true,
+          flyerFileName: flyer.fileName,
         },
       };
 
@@ -1017,7 +1738,9 @@ app.post('/api/flyers/extract-all-pages', async (req, res) => {
         const fakeRes: any = {
           status: () => fakeRes,
           json: (data: any) => {
-            if (data.success) processedCount++;
+            if (data.success && data.items && data.items.length > 0) {
+              processedCount++;
+            }
             resolve();
           },
         };
@@ -1034,6 +1757,7 @@ app.post('/api/flyers/extract-all-pages', async (req, res) => {
     totalPages: successfulFlyers.length,
     totalExtractedProducts: currentExtractedItems.length,
     items: currentExtractedItems,
+    remainingFlyers: lastDownloadedFlyers,
   });
 });
 
@@ -1041,12 +1765,19 @@ app.post('/api/flyers/extract-all-pages', async (req, res) => {
 app.post('/api/set-extracted-items', (req, res) => {
   const { items, validade } = req.body;
   if (Array.isArray(items)) {
-    currentExtractedItems = items;
+    const dates = parseValidityDates(validade || '23/10 a 29/10/2026');
+    currentExtractedItems = items.map((it: any, idx: number) => ({
+      ...it,
+      id: it.id || `item-restored-${Date.now()}-${idx}`,
+      nome_mercado: it.nome_mercado || 'Abimar Supermercados',
+      data_inicial: it.data_inicial || dates.dataInicial || '23/10/2026',
+      data_final: it.data_final || dates.dataFinal || '29/10/2026',
+    }));
     lastExtractionMetadata = {
       validade: validade || 'Válidas de 23/10 a 29/10/2026',
       timestamp: new Date().toLocaleTimeString(),
       totalPages: 1,
-      totalItems: items.length,
+      totalItems: currentExtractedItems.length,
     };
   }
   res.json({ success: true, count: currentExtractedItems.length });

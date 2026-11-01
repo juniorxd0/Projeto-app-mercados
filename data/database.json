@@ -1,0 +1,92 @@
+{
+  "mercados": [
+    {
+      "id": "313ba8dc-bd3e-4abd-bf0c-56ef521605de",
+      "nome": "Abimar Supermercados",
+      "ativo": true,
+      "regras_extracao_ia": {
+        "versao_motor": "1.0",
+        "mercado": "Abimar Supermercados",
+        "vigencia": "Extrair obrigatoriamente a data inicial e data final de vigência impressas no panfleto (ex: 'Ofertas válidas de 23/10 a 29/10/2026') e preencher os campos data_inicial e data_final de cada produto.",
+        "regras_especificas": [
+          "Identificar data de vigência no cabeçalho ou rodapé e registrar data_inicial (DD/MM/AAAA) e data_final (DD/MM/AAAA) em todos os produtos.",
+          "Preencher o campo nome_mercado obrigatoriamente com 'Abimar Supermercados'.",
+          "Registrar preco_promocional com desconto exclusivo Clube Abimar quando houver.",
+          "Precisão factual 100% sem alucinações de produtos ou valores."
+        ]
+      },
+      "criado_em": "2026-10-30T20:23:26.960Z",
+      "atualizado_em": "2026-10-31T12:55:00.000Z",
+      "urls": [
+        {
+          "id": "5d041fc9-4f01-453f-8c8e-27db592bdbef",
+          "mercado_id": "313ba8dc-bd3e-4abd-bf0c-56ef521605de",
+          "descricao": "Ofertas Gerais da Semana (Matriz & Filiais)",
+          "url": "https://www.abimarsupermercados.com.br/ofertas/abimar/5",
+          "ativo": true,
+          "criado_em": "2026-10-30T20:23:26.960Z",
+          "atualizado_em": "2026-10-30T20:23:26.960Z"
+        }
+      ]
+    },
+    {
+      "id": "e49f82d1-032a-4122-834c-7c093282b012",
+      "nome": "Giassi Supermercados",
+      "ativo": true,
+      "regras_extracao_ia": {
+        "versao_motor": "1.0",
+        "mercado": "Giassi Supermercados",
+        "vigencia": "Extrair obrigatoriamente a data inicial e data final de vigência impressas no panfleto e preencher os campos data_inicial e data_final de cada produto.",
+        "regras_especificas": [
+          "Identificar data de vigência no cabeçalho ou rodapé e registrar data_inicial (DD/MM/AAAA) e data_final (DD/MM/AAAA) em todos os produtos.",
+          "Preencher o campo nome_mercado obrigatoriamente com 'Giassi Supermercados'.",
+          "Registrar preco_promocional com desconto exclusivo Amigo Giassi quando houver.",
+          "Precisão factual 100% sem alucinações de produtos ou valores."
+        ]
+      },
+      "criado_em": "2026-10-31T13:30:00.000Z",
+      "atualizado_em": "2026-10-31T13:30:00.000Z",
+      "urls": [
+        {
+          "id": "a9042bd1-12c4-49ab-913a-742918451234",
+          "mercado_id": "e49f82d1-032a-4122-834c-7c093282b012",
+          "descricao": "Ofertas e Encartes da Semana",
+          "url": "https://www.giassi.com.br/ofertas",
+          "ativo": true,
+          "criado_em": "2026-10-31T13:30:00.000Z",
+          "atualizado_em": "2026-10-31T13:30:00.000Z"
+        }
+      ]
+    }
+  ],
+  "configuracao_rotina": {
+    "id": "01362362-0663-40e8-b99a-e470f75e0e74",
+    "dias_semana": [
+      1,
+      3,
+      5
+    ],
+    "horario_execucao": "07:30",
+    "frequencia_cron": "30 7 * * 1,3,5",
+    "ativo": true,
+    "ultima_execucao": null,
+    "status_ultima_execucao": null,
+    "log_ultima_execucao": "Sistema inicializado. Mercados cadastrados: Abimar Supermercados e Giassi Supermercados.",
+    "criado_em": "2026-10-30T20:23:26.960Z",
+    "atualizado_em": "2026-10-31T13:30:00.000Z"
+  },
+  "ia_uso": {
+    "limite_diario_requisicoes": 1500,
+    "limite_rpm": 15,
+    "modelo_ativo": "gemini-3.8-flash",
+    "plano_nome": "Gratuito (Google AI Studio - 1.500 RPD)",
+    "data_referencia": "2026-10-31",
+    "requisicoes_hoje": 0,
+    "requisicoes_sucesso": 0,
+    "requisicoes_falhas": 0,
+    "total_paginas_extraidas_hoje": 0,
+    "total_produtos_extraidos_hoje": 0,
+    "ultima_requisicao": null,
+    "historico_recente": []
+  }
+}

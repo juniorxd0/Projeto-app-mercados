@@ -23,11 +23,17 @@ import {
   Layers,
   ArrowDownToLine,
   Check,
+  Building2,
 } from 'lucide-react';
+import AdminPanel from './components/AdminPanel.tsx';
+import AiUsageCard from './components/AiUsageCard.tsx';
 
 export interface ExtractedProduct {
   id: string;
   pageNumber: number;
+  nome_mercado: string;
+  data_inicial: string;
+  data_final: string;
   nome_produto: string;
   marca: string;
   quantidade_volume: number;
@@ -77,6 +83,9 @@ export default function App() {
     'https://www.abimarsupermercados.com.br/ofertas/abimar/5'
   );
 
+  // Active view: 'admin' (Gestão de Mercados & Rotina Automática) or 'extrator' (Inspeção direta Extrator v1.0)
+  const [mainView, setMainView] = useState<'admin' | 'extrator'>('admin');
+
   // Download & Conference state
   const [isDownloadingFlyers, setIsDownloadingFlyers] = useState<boolean>(false);
   const [downloadStepMessage, setDownloadStepMessage] = useState<string>('');
@@ -113,29 +122,35 @@ export default function App() {
   const [manualPageInput, setManualPageInput] = useState<number>(1);
   const [appendMode, setAppendMode] = useState<boolean>(true);
 
-  // Fetch initial state on mount
-  useEffect(() => {
-    // 1. Check if flyers were previously downloaded
+  // Fetch catalog & flyers data from server
+  const loadCatalogData = () => {
     fetch('/api/flyers/status')
       .then((r) => r.json())
       .then((data) => {
         if (data.report) {
           setConferenceReport(data.report);
           setDownloadedFlyers(data.flyers || data.report.detalhes || []);
+        } else if (data.flyers) {
+          setDownloadedFlyers(data.flyers);
         }
       })
       .catch(() => {});
 
-    // 2. Load extracted products
     fetch('/api/extracted-products')
       .then((r) => r.json())
       .then((data) => {
-        if (data.items && data.items.length > 0) {
+        if (data.items) {
           setExtractedProducts(data.items);
-          setMetadata(data.metadata || { validade: '', timestamp: '', totalPages: 1 });
+          if (data.metadata) {
+            setMetadata(data.metadata);
+          }
         }
       })
       .catch(() => {});
+  };
+
+  useEffect(() => {
+    loadCatalogData();
   }, []);
 
   const formatBRL = (val: number | null | undefined) => {
@@ -190,7 +205,7 @@ export default function App() {
     }
   };
 
-  // HANDLER: Extract single downloaded page with AI
+  // HANDLER: Extract single downloaded page with AI (with auto-deletion of flyer upon success)
   const handleExtractDownloadedPage = async (pageNumber: number) => {
     setIsExtractingAI(true);
     setExtractingPageNumber(pageNumber);
@@ -217,9 +232,14 @@ export default function App() {
         totalPages: Math.max(metadata.totalPages, pageNumber),
       });
 
+      // Auto-remove flyer from list only after confirmed successful extraction of products
+      if (data.flyerDeleted || newItems.length > 0) {
+        setDownloadedFlyers((prev) => prev.filter((f) => f.pageNumber !== pageNumber));
+      }
+
       setStatusType('success');
       setStatusMessage(
-        `Página ${pageNumber} transcrita com sucesso! Extraídos ${newItems.length} produtos reais (via ${data.usedModel || 'Gemini'}). Total no catálogo: ${updated.length} itens.`
+        `Página ${pageNumber} transcrita com sucesso! Extraídos ${newItems.length} produtos reais (via ${data.usedModel || 'Gemini'}). O panfleto foi excluído do servidor com segurança.`
       );
     } catch (err: any) {
       setStatusType('error');
@@ -230,7 +250,7 @@ export default function App() {
     }
   };
 
-  // HANDLER: Extract all downloaded pages with AI sequentially
+  // HANDLER: Extract all downloaded pages with AI sequentially (auto-deleting each flyer upon success)
   const handleExtractAllDownloadedPages = async () => {
     if (downloadedFlyers.length === 0) return;
 
@@ -240,11 +260,12 @@ export default function App() {
 
     try {
       let currentList = appendMode ? [...extractedProducts] : [];
+      const flyersToProcess = [...downloadedFlyers];
 
-      for (let i = 0; i < downloadedFlyers.length; i++) {
-        const flyer = downloadedFlyers[i];
+      for (let i = 0; i < flyersToProcess.length; i++) {
+        const flyer = flyersToProcess[i];
         setStatusMessage(
-          `Extraindo produtos da Página ${flyer.pageNumber} de ${downloadedFlyers.length} com IA...`
+          `Extraindo produtos da Página ${flyer.pageNumber} (${i + 1}/${flyersToProcess.length}) com IA...`
         );
 
         const res = await fetch('/api/flyers/extract-downloaded-page', {
@@ -258,18 +279,52 @@ export default function App() {
           const pageItems: ExtractedProduct[] = data.items || [];
           currentList = [...currentList, ...pageItems];
           setExtractedProducts([...currentList]);
+
+          // Confirmed extraction: remove this flyer from local state
+          if (data.flyerDeleted || pageItems.length > 0) {
+            setDownloadedFlyers((prev) => prev.filter((f) => f.pageNumber !== flyer.pageNumber));
+          }
         }
       }
 
       setStatusType('success');
       setStatusMessage(
-        `Extração de todos os panfletos concluída! Total de ${currentList.length} produtos catalogados com precisão factual.`
+        `Extração de todos os panfletos concluída! Total de ${currentList.length} produtos catalogados e panfletos excluídos do servidor com segurança.`
       );
     } catch (err: any) {
       setStatusType('error');
       setStatusMessage(err.message || 'Erro durante extração');
     } finally {
       setIsExtractingAI(false);
+    }
+  };
+
+  // HANDLER: Delete all downloaded flyers manually
+  const handleDeleteAllFlyers = async () => {
+    try {
+      await fetch('/api/flyers/clear-all', { method: 'DELETE' });
+      setDownloadedFlyers([]);
+      setConferenceReport(null);
+      setStatusType('info');
+      setStatusMessage('Todos os panfletos baixados foram excluídos com sucesso do disco.');
+    } catch (err: any) {
+      console.error('Erro ao excluir panfletos:', err);
+      setDownloadedFlyers([]);
+      setStatusType('info');
+      setStatusMessage('Panfletos removidos localmente.');
+    }
+  };
+
+  // HANDLER: Delete single downloaded flyer manually
+  const handleDeleteSingleFlyer = async (pageNumber: number) => {
+    try {
+      await fetch(`/api/flyers/page/${pageNumber}`, { method: 'DELETE' });
+      setDownloadedFlyers((prev) => prev.filter((f) => f.pageNumber !== pageNumber));
+      setStatusType('info');
+      setStatusMessage(`Panfleto da Página ${pageNumber} excluído com sucesso do disco.`);
+    } catch (err: any) {
+      console.error('Erro ao excluir panfleto:', err);
+      setDownloadedFlyers((prev) => prev.filter((f) => f.pageNumber !== pageNumber));
     }
   };
 
@@ -286,13 +341,17 @@ export default function App() {
     }
   };
 
-  // HANDLER: Clear catalog
+  // HANDLER: Clear catalog (direct without blocking iframe confirm)
   const handleClearCatalog = async () => {
-    if (!confirm('Deseja limpar todos os produtos da tabela?')) return;
-    await fetch('/api/clear-extracted', { method: 'POST' });
+    try {
+      await fetch('/api/clear-extracted', { method: 'POST' });
+    } catch (e) {
+      console.warn('Erro ao limpar produtos no servidor:', e);
+    }
     setExtractedProducts([]);
     setMetadata({ validade: '', timestamp: '', totalPages: 0 });
-    setStatusMessage('Tabela de produtos limpa.');
+    setStatusType('info');
+    setStatusMessage('Tabela de produtos limpa com sucesso.');
   };
 
   // HANDLER: Copy conference report to clipboard
@@ -390,8 +449,11 @@ ${conferenceReport.detalhes
     const s = searchFilter.toLowerCase();
     return (
       p.nome_produto.toLowerCase().includes(s) ||
-      p.marca.toLowerCase().includes(s) ||
-      p.categoria.toLowerCase().includes(s)
+      (p.marca && p.marca.toLowerCase().includes(s)) ||
+      (p.categoria && p.categoria.toLowerCase().includes(s)) ||
+      (p.nome_mercado && p.nome_mercado.toLowerCase().includes(s)) ||
+      (p.data_inicial && p.data_inicial.includes(s)) ||
+      (p.data_final && p.data_final.includes(s))
     );
   });
 
@@ -441,13 +503,62 @@ ${conferenceReport.detalhes
         </div>
       </header>
 
+      {/* Top View Selector Navigation Bar */}
+      <nav className="bg-white border-b border-slate-200">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center gap-2 py-2 overflow-x-auto">
+          <button
+            type="button"
+            onClick={() => setMainView('admin')}
+            className={`px-4 py-2 rounded-xl text-xs font-black flex items-center gap-2 transition-all cursor-pointer border shrink-0 ${
+              mainView === 'admin'
+                ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
+                : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Building2 className="w-4 h-4 text-emerald-400" />
+            <span>Módulo de Automação & Gestão de Mercados</span>
+            <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-bold">
+              1:N URLs & Cron
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMainView('extrator')}
+            className={`px-4 py-2 rounded-xl text-xs font-black flex items-center gap-2 transition-all cursor-pointer border shrink-0 ${
+              mainView === 'extrator'
+                ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm'
+                : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            <span>Extrator v1.0 • Inspeção de Panfletos & Produtos</span>
+            {downloadedFlyers.length > 0 && (
+              <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-bold">
+                {downloadedFlyers.length} Págs Prontas
+              </span>
+            )}
+          </button>
+        </div>
+      </nav>
+
       {/* Main Container */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 space-y-6">
-        {/* SECTION 1: URL Input & Full Download Trigger */}
-        <section className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 shadow-sm space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <Link2 className="w-5 h-5 text-emerald-600 shrink-0" />
+        {/* Real-time AI Usage & Daily Quota Widget */}
+        <AiUsageCard compact />
+
+        {mainView === 'admin' ? (
+          <AdminPanel
+            onSwitchToInspector={() => setMainView('extrator')}
+            onRefreshCatalog={loadCatalogData}
+          />
+        ) : (
+          <>
+            {/* SECTION 1: URL Input & Full Download Trigger */}
+            <section className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 shadow-sm space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Link2 className="w-5 h-5 text-emerald-600 shrink-0" />
               <label htmlFor="url-input" className="text-sm font-black text-slate-900">
                 Página de Ofertas do Supermercado:
               </label>
@@ -706,27 +817,38 @@ ${conferenceReport.detalhes
                   </span>
                 </h2>
                 <p className="text-xs text-slate-500 mt-1">
-                  Todos os arquivos foram baixados em resolução nativa (1383x1800) e validados contra corrupção.
+                  Todos os arquivos foram baixados em resolução nativa (1383x1800). Após a extração dos produtos ser confirmada com êxito pelo Gemini Vision, os panfletos são excluídos automaticamente para liberar espaço.
                 </p>
               </div>
 
-              <button
-                onClick={handleExtractAllDownloadedPages}
-                disabled={isExtractingAI}
-                className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
-              >
-                {isExtractingAI && extractingPageNumber === null ? (
-                  <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    <span>Extraindo Todos com IA...</span>
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Extrair Produtos de Todos os {downloadedFlyers.length} Panfletos</span>
-                  </>
-                )}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={handleDeleteAllFlyers}
+                  className="px-3 py-2 rounded-xl bg-white hover:bg-rose-50 text-rose-700 hover:text-rose-800 border border-slate-300 hover:border-rose-300 font-bold text-xs flex items-center justify-center gap-1.5 shadow-2xs transition-all cursor-pointer"
+                  title="Excluir manualmente todos os panfletos baixados do disco"
+                >
+                  <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                  <span>Excluir Panfletos Baixados ({downloadedFlyers.length})</span>
+                </button>
+
+                <button
+                  onClick={handleExtractAllDownloadedPages}
+                  disabled={isExtractingAI}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+                >
+                  {isExtractingAI && extractingPageNumber === null ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Extraindo Todos com IA...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Extrair Produtos de Todos os {downloadedFlyers.length} Panfletos</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
             {/* Grid dos Panfletos */}
@@ -810,6 +932,13 @@ ${conferenceReport.detalhes
                           >
                             <Download className="w-3 h-3" />
                           </a>
+                          <button
+                            onClick={() => handleDeleteSingleFlyer(flyer.pageNumber)}
+                            className="p-1 rounded bg-white hover:bg-rose-50 text-slate-500 hover:text-rose-600 border border-slate-200 hover:border-rose-200 transition-colors cursor-pointer"
+                            title={`Excluir panfleto da Página ${flyer.pageNumber}`}
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
                         </div>
                       </div>
                     </div>
@@ -846,16 +975,16 @@ ${conferenceReport.detalhes
             </div>
 
             {/* Filter Search Input & Actions */}
-            <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
               {extractedProducts.length > 0 && (
                 <>
-                  <div className="relative flex-1 sm:w-64">
+                  <div className="relative flex-1 sm:w-64 min-w-[180px]">
                     <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
                     <input
                       type="text"
                       value={searchFilter}
                       onChange={(e) => setSearchFilter(e.target.value)}
-                      placeholder="Pesquisar produto ou marca..."
+                      placeholder="Pesquisar mercado, produto, data..."
                       className="w-full bg-white border border-slate-300 rounded-xl pl-9 pr-3 py-1.5 text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:border-emerald-600 shadow-2xs font-medium"
                     />
                   </div>
@@ -863,12 +992,22 @@ ${conferenceReport.detalhes
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(JSON.stringify(extractedProducts, null, 2));
-                      alert('JSON copiado com sucesso!');
+                      setStatusType('success');
+                      setStatusMessage('JSON dos produtos copiado com sucesso para a área de transferência!');
                     }}
                     className="p-2 rounded-xl bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors shadow-2xs shrink-0 cursor-pointer"
                     title="Copiar JSON dos produtos"
                   >
                     <Copy className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    onClick={handleClearCatalog}
+                    className="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-bold flex items-center gap-1.5 transition-colors shadow-2xs shrink-0 cursor-pointer"
+                    title="Limpar todos os produtos catalogados da tabela"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                    <span>Limpar Tabela ({extractedProducts.length})</span>
                   </button>
                 </>
               )}
@@ -895,6 +1034,9 @@ ${conferenceReport.detalhes
                   <tr>
                     <th className="py-3 px-3 text-center w-10">#</th>
                     <th className="py-3 px-3 text-center w-12">Pág.</th>
+                    <th className="py-3 px-3">Mercado</th>
+                    <th className="py-3 px-3 whitespace-nowrap">Data Inicial</th>
+                    <th className="py-3 px-3 whitespace-nowrap">Data Final</th>
                     <th className="py-3 px-4">Nome do Produto</th>
                     <th className="py-3 px-3">Marca</th>
                     <th className="py-3 px-3">Volume / Peso</th>
@@ -917,6 +1059,22 @@ ${conferenceReport.detalhes
                         </td>
                         <td className="py-3 px-3 text-center font-bold text-slate-600 bg-slate-50/80">
                           {item.pageNumber}
+                        </td>
+                        <td className="py-3 px-3 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-amber-50 text-amber-900 border border-amber-200">
+                            <Building2 className="w-3 h-3 text-amber-700" />
+                            <span>{item.nome_mercado || 'Abimar Supermercados'}</span>
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 whitespace-nowrap font-mono">
+                          <span className="inline-block px-2 py-0.5 rounded text-[11px] font-bold text-slate-700 bg-slate-100 border border-slate-200">
+                            {item.data_inicial || '—'}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 whitespace-nowrap font-mono">
+                          <span className="inline-block px-2 py-0.5 rounded text-[11px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-200">
+                            {item.data_final || '—'}
+                          </span>
                         </td>
                         <td className="py-3 px-4">
                           <div className="font-bold text-slate-900 text-sm">{item.nome_produto}</div>
@@ -1030,6 +1188,8 @@ ${conferenceReport.detalhes
             </div>
           )}
         </div>
+      </>
+    )}
 
         {/* FOOTER: BASE HOMOLOGADA v1.0 */}
         <footer className="border-t border-slate-200/80 pt-6 pb-2 text-center text-xs text-slate-500">

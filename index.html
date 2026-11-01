@@ -3,10 +3,52 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SuperCompara • Extrator v1.0 - Leitor & Downloader de Panfletos</title>
-    <meta name="description" content="Extrator v1.0: Motor oficial e homologado para download completo de panfletos JPEG em alta resolução e extração precisa de produtos e preços de supermercados com IA." />
-    <meta property="og:title" content="SuperCompara • Extrator v1.0 - Leitor & Downloader de Panfletos" />
-    <meta property="og:description" content="Extrator v1.0: Motor oficial e homologado para download completo de panfletos JPEG em alta resolução e extração precisa de produtos e preços de supermercados com IA." />
+    <script>
+      (function() {
+        try {
+          var realFetch = window.fetch ? window.fetch.bind(window) : null;
+          var currentFetch = realFetch;
+          var descriptor = {
+            get: function() {
+              return currentFetch;
+            },
+            set: function(val) {
+              currentFetch = val;
+            },
+            configurable: true,
+            enumerable: true
+          };
+
+          try {
+            Object.defineProperty(window, 'fetch', descriptor);
+          } catch (e1) {
+            try {
+              if (window.Window && window.Window.prototype) {
+                Object.defineProperty(window.Window.prototype, 'fetch', descriptor);
+              }
+            } catch (e2) {}
+          }
+        } catch (e) {}
+
+        window.addEventListener('error', function(event) {
+          if (
+            event &&
+            event.message &&
+            event.message.indexOf('Cannot set property fetch') !== -1
+          ) {
+            event.preventDefault();
+            if (typeof event.stopImmediatePropagation === 'function') {
+              event.stopImmediatePropagation();
+            }
+            return true;
+          }
+        }, true);
+      })();
+    </script>
+    <title>SuperCompara • Automação, Gestão de Mercados & Extrator v1.0</title>
+    <meta name="description" content="Módulo administrativo completo para gestão de mercados (1:N URLs), agendamento de rotinas periódicas (node-cron) e Extrator v1.0 com download e leitura factual de encartes via IA." />
+    <meta property="og:title" content="SuperCompara • Automação, Gestão de Mercados & Extrator v1.0" />
+    <meta property="og:description" content="Módulo administrativo completo para gestão de mercados (1:N URLs), agendamento de rotinas periódicas (node-cron) e Extrator v1.0 com download e leitura factual de encartes via IA." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
   </head>

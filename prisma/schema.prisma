@@ -1,0 +1,61 @@
+// This is your Prisma schema file for SuperCompara
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StatusExecucao {
+  SUCESSO
+  FALHA
+  PROCESSANDO
+}
+
+model Mercado {
+  id                 String       @id @default(uuid())
+  nome               String       @unique
+  ativo              Boolean      @default(true)
+  regras_extracao_ia Json?        // Campo preparado para armazenar prompts, seletores e regras personalizadas de IA por mercado
+  criado_em          DateTime     @default(now())
+  atualizado_em      DateTime     @updatedAt
+
+  urls               MercadoUrl[]
+
+  @@index([nome])
+  @@map("mercados")
+}
+
+model MercadoUrl {
+  id          String   @id @default(uuid())
+  mercado_id  String
+  descricao   String   // Ex: "Ofertas Gerais", "Hortifrúti da Quarta", "Fim de Semana"
+  url         String   // URL base do encarte do mercado
+  ativo       Boolean  @default(true)
+  criado_em   DateTime @default(now())
+  atualizado_em DateTime @updatedAt
+
+  mercado     Mercado  @relation(fields: [mercado_id], references: [id], onDelete: Cascade)
+
+  @@index([mercado_id])
+  @@map("mercado_urls")
+}
+
+model ConfiguracaoRotina {
+  id                     String          @id @default(uuid())
+  dias_semana            Int[]           // Array de inteiros: 0=Domingo, 1=Segunda, 2=Terça, 3=Quarta, 4=Quinta, 5=Sexta, 6=Sábado
+  horario_execucao       String          // Formato HH:mm (Ex: "06:00")
+  frequencia_cron        String          // Expressão cron calculada (Ex: "0 6 * * 1,3,5")
+  ativo                  Boolean         @default(true)
+  ultima_execucao        DateTime?
+  status_ultima_execucao StatusExecucao?
+  log_ultima_execucao    String?         @db.Text
+  criado_em              DateTime        @default(now())
+  atualizado_em          DateTime        @updatedAt
+
+  @@map("configuracoes_rotina")
+}
