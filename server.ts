@@ -4,9 +4,15 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import * as cheerio from 'cheerio';
+import vm from 'node:vm';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { dbService } from './src/server/db.js';
+import {
+  dbService,
+  generateProductCompositeKey,
+  normalizeKeyText,
+  ExtractedProductModel,
+} from './src/server/db.js';
 import {
   initCronService,
   rescheduleCron,
@@ -21,7 +27,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+const cliPortIndex = process.argv.indexOf('--port');
+const cliPort = cliPortIndex !== -1 && process.argv[cliPortIndex + 1] ? Number(process.argv[cliPortIndex + 1]) : null;
+const PORT = cliPort || (process.env.NODE_ENV === 'production' && process.env.PORT ? Number(process.env.PORT) : 3000);
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -35,6 +43,7 @@ app.use('/downloads/panfletos', express.static(DOWNLOADS_DIR));
 
 export interface ExtractedProductItem {
   id: string;
+  chave_unica?: string; // Chave única composta (ex: abimar_arroz_tio_joao_5_kg_23102026_29102026)
   pageNumber: number;
   nome_mercado: string;
   data_inicial: string;
@@ -50,6 +59,8 @@ export interface ExtractedProductItem {
   categoria: string;
   preco_unitario_equivalente: number;
   preco_unitario_label: string;
+  criado_em?: string;
+  atualizado_em?: string;
 }
 
 // Helper: Resolve Mercado from URL using registered Bloco A markets
@@ -84,7 +95,30 @@ export function resolveMercadoFromUrl(targetUrl: string): { nome: string; regras
     console.warn('[Mercado Resolver] Erro ao resolver mercado:', e);
   }
 
-  if ((targetUrl || '').toLowerCase().includes('abimar')) {
+  const lowerUrl = (targetUrl || '').toLowerCase();
+  if (lowerUrl.includes('fort')) {
+    return {
+      nome: 'Fort Atacadista',
+      regras: {
+        versao_motor: '1.0',
+        mercado: 'Fort Atacadista',
+        vigencia: 'Extrair vigência de ofertas informada no encarte ou título.',
+      },
+    };
+  }
+
+  if (lowerUrl.includes('giassi')) {
+    return {
+      nome: 'Giassi Supermercados',
+      regras: {
+        versao_motor: '1.0',
+        mercado: 'Giassi Supermercados',
+        vigencia: 'Extrair vigência de ofertas informada no encarte.',
+      },
+    };
+  }
+
+  if (lowerUrl.includes('abimar')) {
     return {
       nome: 'Abimar Supermercados',
       regras: { versao: '1.0' },
@@ -182,8 +216,8 @@ export interface FlyerConferenceReport {
   tempoTotalSegundos: number;
 }
 
-// In-memory store of extracted items & downloaded flyers
-let currentExtractedItems: ExtractedProductItem[] = [];
+// In-memory store of extracted items & downloaded flyers synced with DB
+let currentExtractedItems: ExtractedProductItem[] = dbService.getProdutosExtraidos();
 let lastDownloadedFlyers: DownloadedFlyer[] = [];
 let lastConferenceReport: FlyerConferenceReport | null = null;
 let lastSourceUrl: string = 'https://www.abimarsupermercados.com.br/ofertas/abimar/5';
@@ -191,7 +225,7 @@ let lastExtractionMetadata = {
   validade: '',
   timestamp: '',
   totalPages: 0,
-  totalItems: 0,
+  totalItems: currentExtractedItems.length,
 };
 
 // Setup server-side Gemini client
@@ -231,29 +265,32 @@ function calculateEquivalentPrice(preco: number, volume: number, unidade: string
   return { valor: preco, label: `R$ ${preco.toFixed(2).replace('.', ',')} / un` };
 }
 
-// ----------------------------------------------------
-// API ROUTES (LASER-FOCUSED ON ACCURATE EXTRACTION ONLY)
-// ----------------------------------------------------
-
-// Get current extracted items
+// Get current extracted items from persistent store
 app.get('/api/extracted-products', (req, res) => {
+  const persistedItems = dbService.getProdutosExtraidos();
+  currentExtractedItems = persistedItems;
   res.json({
     url: lastSourceUrl,
-    metadata: lastExtractionMetadata,
-    items: currentExtractedItems,
+    metadata: {
+      ...lastExtractionMetadata,
+      totalItems: persistedItems.length,
+    },
+    items: persistedItems,
   });
 });
 
-// Delete single product by ID
+// Delete single product by ID from persistent store
 app.delete('/api/extracted-products/:id', (req, res) => {
   const { id } = req.params;
-  currentExtractedItems = currentExtractedItems.filter((item) => item.id !== id);
+  dbService.deleteProduto(id);
+  currentExtractedItems = dbService.getProdutosExtraidos();
   lastExtractionMetadata.totalItems = currentExtractedItems.length;
   res.json({ success: true, count: currentExtractedItems.length });
 });
 
-// Clear all extracted items
+// Clear all extracted items from persistent store
 app.post('/api/clear-extracted', (req, res) => {
+  dbService.clearProdutos();
   currentExtractedItems = [];
   lastExtractionMetadata = {
     validade: '',
@@ -261,7 +298,7 @@ app.post('/api/clear-extracted', (req, res) => {
     totalPages: 0,
     totalItems: 0,
   };
-  res.json({ success: true });
+  res.json({ success: true, count: 0 });
 });
 
 // Helper: Get JPEG dimensions directly from binary buffer
@@ -369,7 +406,7 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
 } {
   const $ = cheerio.load(html);
 
-  // Extract promotional dates/validity
+  // Extract promotional dates/validity from general text
   let dateMatch = html.match(
     /v[aá]lidas?\s+(?:de\s+)?(\d{1,2}\/\d{1,2}(?:\s*a\s*\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)?)/i
   );
@@ -378,9 +415,80 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
       /ofertas\s+v[aá]lidas?\s+(?:de\s+)?(\d{1,2}\/\d{1,2}\/\d{4}\s+a\s+\d{1,2}\/\d{1,2}\/\d{4})/i
     );
   }
-  const validade = dateMatch ? dateMatch[0].trim() : 'Ofertas válidas no encarte';
+  let validade = dateMatch ? dateMatch[0].trim() : '';
 
   const candidatesMap = new Map<string, IdentifiedFlyerItem>();
+
+  // STRATEGY 0: Apollo State / StorefrontFlyer (Fort Atacadista, oSuper, VIP Commerce)
+  try {
+    if (html.includes('StorefrontFlyer') || html.includes('window.APOLLO_STATE')) {
+      const apolloIdx = html.indexOf('window.APOLLO_STATE =');
+      if (apolloIdx !== -1) {
+        const endScript = html.indexOf('</script>', apolloIdx);
+        if (endScript !== -1) {
+          const scriptCode = html.substring(apolloIdx, endScript);
+          const sandbox: any = { window: {} };
+          vm.createContext(sandbox);
+          vm.runInContext(scriptCode, sandbox, { timeout: 2000 });
+          const apollo = sandbox.window.APOLLO_STATE || {};
+          const flyerKeys = Object.keys(apollo).filter((k) => k.startsWith('StorefrontFlyer:'));
+
+          if (flyerKeys.length > 0) {
+            console.log(`[Flyer Identification] Encontrados ${flyerKeys.length} encartes no Apollo State (Fort Atacadista).`);
+
+            flyerKeys.forEach((fk, idx) => {
+              const flyer = apollo[fk];
+              const title = flyer?.title || `Encarte Fort Atacadista ${idx + 1}`;
+              const cover = flyer?.coverImage;
+              let imgUrl = '';
+              if (cover) {
+                imgUrl =
+                  cover['thumborized({"height":330})'] ||
+                  cover.thumborized ||
+                  cover.url ||
+                  '';
+              }
+
+              if (imgUrl) {
+                const highResUrl = new URL(imgUrl, baseUrl).href;
+                const baseKey = `fort-flyer-${flyer.id || idx + 1}`;
+                candidatesMap.set(baseKey, {
+                  pageNumber: idx + 1,
+                  highResUrl,
+                  thumbUrl: highResUrl,
+                  alt: title,
+                  width: 1400,
+                  height: 1800,
+                });
+
+                // Extract validity from title if not already found (e.g. "04 e 05_NOV_26" or "02 a 08_NOV_26")
+                if (!validade) {
+                  const titleDateMatch = title.match(/(\d{1,2}(?:\s*(?:a|e)\s*\d{1,2})?_[A-Z]{3}(?:_[A-Z]{3})?_\d{2,4})/i);
+                  if (titleDateMatch) {
+                    validade = `Ofertas vigentes (${titleDateMatch[0].replace(/_/g, ' ')})`;
+                  }
+                }
+              }
+            });
+
+            // If Apollo State has the exact official flyers (e.g. Fort Atacadista), return them directly
+            if (candidatesMap.size > 0) {
+              const sortedFlyers = Array.from(candidatesMap.values()).sort((a, b) => a.pageNumber - b.pageNumber);
+              sortedFlyers.forEach((item, index) => {
+                item.pageNumber = index + 1;
+              });
+              return {
+                validade: validade || 'Ofertas válidas no encarte',
+                flyers: sortedFlyers,
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (apolloErr: any) {
+    console.warn('[Flyer Identification] Aviso ao processar Apollo State:', apolloErr.message);
+  }
 
   // STRATEGY 1: Dedicated Gallery Container (#galeria a, .galeria a, etc.)
   const galleryLinks = $('#galeria a, .galeria a, [id*="galeria"] a, [class*="galeria"] a');
@@ -393,34 +501,43 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
       const width = Number($(el).attr('data-pswp-width')) || undefined;
       const height = Number($(el).attr('data-pswp-height')) || undefined;
 
-      // Extract high-res image URL: if <a> href points to image, use it!
       const isHrefImage = /\.(jpe?g|png|webp)/i.test(href);
       const isSrcImage = /\.(jpe?g|png|webp)/i.test(src);
 
       if (isHrefImage || isSrcImage) {
         const highResUrl = isHrefImage ? new URL(href, baseUrl).href : new URL(src, baseUrl).href;
         const thumbUrl = isSrcImage ? new URL(src, baseUrl).href : highResUrl;
-
-        // Base image identifier (filename without folder path)
         const baseKey = highResUrl.split('/').pop()?.split('?')[0] || `item-${idx + 1}`;
 
-        // Parse page number from alt, e.g. "page-1" -> 1
         let pageNum = idx + 1;
         const altPageMatch = alt.match(/page-(\d+)|p[aá]g(?:ina)?[-_\s]*(\d+)/i);
         if (altPageMatch) {
           pageNum = Number(altPageMatch[1] || altPageMatch[2]);
         }
 
-        candidatesMap.set(baseKey, {
-          pageNumber: pageNum,
-          highResUrl,
-          thumbUrl,
-          alt,
-          width,
-          height,
-        });
+        if (!candidatesMap.has(baseKey)) {
+          candidatesMap.set(baseKey, {
+            pageNumber: pageNum,
+            highResUrl,
+            thumbUrl,
+            alt,
+            width,
+            height,
+          });
+        }
       }
     });
+
+    if (candidatesMap.size > 0) {
+      const sortedFlyers = Array.from(candidatesMap.values()).sort((a, b) => a.pageNumber - b.pageNumber);
+      sortedFlyers.forEach((item, index) => {
+        item.pageNumber = index + 1;
+      });
+      return {
+        validade: validade || 'Ofertas válidas no encarte',
+        flyers: sortedFlyers,
+      };
+    }
   }
 
   // STRATEGY 2: All <a> tags linking to JPEG/PNG images
@@ -442,7 +559,7 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
     }
   });
 
-  // STRATEGY 3: Lazy-loaded images (data-src, data-original, data-lazy)
+  // STRATEGY 3: Lazy-loaded & responsive images (img tags with matching classes/src/alt)
   $('img').each((idx, el) => {
     const src =
       $(el).attr('data-src') ||
@@ -452,23 +569,27 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
       $(el).attr('src') ||
       '';
 
-    if (
-      /\.(jpe?g|png|webp)/i.test(src) &&
-      !/logo|icon|avatar|favicon|cart|whatsapp|facebook|instagram|google/i.test(src) &&
-      /thumb|oferta|encarte|caderno|folheto|page|anuncio|publicacao|\d{10,}/i.test(src)
-    ) {
+    const alt = $(el).attr('alt') || '';
+
+    const isExcluded = /logo|icon|avatar|favicon|cart|whatsapp|facebook|instagram|google|bandeira|mastercard|visa|elo/i.test(
+      src + ' ' + alt
+    );
+
+    const isFlyerCandidate =
+      /thumb|oferta|encarte|caderno|folheto|page|p[aá]gina|campanha|semana|natal|revista|sc_fort|fort|anuncio|publicacao|\d{10,}/i.test(
+        src + ' ' + alt
+      );
+
+    if (/\.(jpe?g|png|webp)/i.test(src) && !isExcluded && isFlyerCandidate) {
       const fullUrl = new URL(src, baseUrl).href;
       const baseKey = fullUrl.split('/').pop()?.split('?')[0] || `img-${idx}`;
 
-      // If we already have a 1383x1800 high-res version of this file, keep it
       if (!candidatesMap.has(baseKey)) {
-        // If it's a thumbnail like /thumbs/767/998/X.jpg, try to derive high-res /thumbs/1383/1800/X.jpg
         let highResUrl = fullUrl;
         if (fullUrl.includes('/thumbs/767/998/')) {
           highResUrl = fullUrl.replace('/thumbs/767/998/', '/thumbs/1383/1800/');
         }
 
-        const alt = $(el).attr('alt') || `page-${candidatesMap.size + 1}`;
         let pageNum = candidatesMap.size + 1;
         const altMatch = alt.match(/page-(\d+)|p[aá]g(?:ina)?[-_\s]*(\d+)/i);
         if (altMatch) pageNum = Number(altMatch[1] || altMatch[2]);
@@ -477,11 +598,15 @@ function identifyAllFlyersFromHtml(html: string, baseUrl: string): {
           pageNumber: pageNum,
           highResUrl,
           thumbUrl: fullUrl,
-          alt,
+          alt: alt || `page-${pageNum}`,
         });
       }
     }
   });
+
+  if (!validade) {
+    validade = 'Ofertas válidas no encarte';
+  }
 
   // Sort flyers by pageNumber
   const sortedFlyers = Array.from(candidatesMap.values()).sort((a, b) => a.pageNumber - b.pageNumber);
@@ -505,8 +630,52 @@ export function sanitizeMarketSlug(marketName: string): string {
     .replace(/[\u0300-\u036f]/g, '');
   if (norm.includes('giassi')) return 'giassi';
   if (norm.includes('abimar')) return 'abimar';
+  if (norm.includes('fort')) return 'fort';
   const slug = norm.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
   return slug || 'mercado';
+}
+
+// Resilient fetch helper with exponential backoff for transient DNS (EAI_AGAIN) and network hiccups
+export async function fetchWithNetworkRetry(
+  url: string,
+  options: RequestInit = {},
+  maxRetries = 3,
+  baseDelayMs = 1000
+): Promise<Response> {
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      return response;
+    } catch (err: any) {
+      lastError = err;
+      const isTransient =
+        err?.code === 'EAI_AGAIN' ||
+        err?.cause?.code === 'EAI_AGAIN' ||
+        err?.code === 'ENOTFOUND' ||
+        err?.cause?.code === 'ENOTFOUND' ||
+        err?.code === 'ECONNRESET' ||
+        err?.cause?.code === 'ECONNRESET' ||
+        err?.code === 'ETIMEDOUT' ||
+        err?.cause?.code === 'ETIMEDOUT' ||
+        err?.name === 'TimeoutError' ||
+        String(err?.message).includes('fetch failed') ||
+        String(err?.message).includes('EAI_AGAIN');
+
+      if (attempt < maxRetries && isTransient) {
+        const wait = baseDelayMs * Math.pow(1.6, attempt - 1);
+        console.warn(
+          `[Network Retry] Tentativa ${attempt}/${maxRetries} falhou para ${url} (${err?.cause?.code || err?.code || err?.message}). Nova tentativa em ${Math.round(wait)}ms...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, wait));
+      } else {
+        break;
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 // Download a single flyer with retries, exponential backoff, and strict JPEG verification
@@ -533,20 +702,54 @@ async function downloadSingleFlyer(
     urlsToTry.push(item.thumbUrl);
   }
 
+  // Pre-add high-resolution proxy fallback for Cloudflare-protected CDNs (oSuper, Fort Atacadista, S3)
+  if (
+    item.highResUrl.includes('osuper.com.br') ||
+    item.highResUrl.includes('amazonaws.com') ||
+    item.highResUrl.includes('fortatacadista')
+  ) {
+    urlsToTry.push(`https://wsrv.nl/?url=${encodeURIComponent(item.highResUrl)}&w=1400&output=jpg`);
+    if (item.thumbUrl && item.thumbUrl !== item.highResUrl) {
+      urlsToTry.push(`https://wsrv.nl/?url=${encodeURIComponent(item.thumbUrl)}&w=1400&output=jpg`);
+    }
+  }
+
   while (attempts < maxRetries && !success) {
     attempts++;
     for (const downloadUrl of urlsToTry) {
       try {
         console.log(`[Downloader] Tentativa ${attempts} para Pág. ${item.pageNumber} (${targetFileName} - ${marketName}) de ${downloadUrl}...`);
-        const response = await fetch(downloadUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-            Referer: baseUrl,
+        let response = await fetchWithNetworkRetry(
+          downloadUrl,
+          {
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              Referer: baseUrl,
+            },
+            signal: AbortSignal.timeout(35000), // Generous 35s timeout for high-res images
           },
-          signal: AbortSignal.timeout(35000), // Generous 35s timeout for high-res images
-        });
+          2,
+          800
+        );
+
+        // If blocked by Cloudflare (403 Forbidden) and not already using proxy, try proxy immediately
+        if (response.status === 403 && !downloadUrl.includes('wsrv.nl')) {
+          console.warn(`[Downloader] Acesso a ${downloadUrl} retornou HTTP 403 (Cloudflare WAF). Alternando imediatamente para proxy de imagem...`);
+          const proxyUrl = `https://wsrv.nl/?url=${encodeURIComponent(downloadUrl)}&w=1400&output=jpg`;
+          response = await fetchWithNetworkRetry(
+            proxyUrl,
+            {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              },
+              signal: AbortSignal.timeout(35000),
+            },
+            2,
+            800
+          );
+        }
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -623,15 +826,20 @@ export async function executeFullFlyerDownloadAndAudit(
 
   console.log(`[Downloader] Iniciando varredura da URL (${resolvedMarket}): ${targetUrl}`);
 
-  // Fetch page HTML
-  const response = await fetch(targetUrl, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  // Fetch page HTML with automatic DNS retry & backoff
+  const response = await fetchWithNetworkRetry(
+    targetUrl,
+    {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      },
+      signal: AbortSignal.timeout(25000),
     },
-    signal: AbortSignal.timeout(20000),
-  });
+    3,
+    1000
+  );
 
   if (!response.ok) {
     throw new Error(`Falha ao acessar o site do supermercado (${resolvedMarket}): HTTP ${response.status}`);
@@ -735,10 +943,20 @@ app.post('/api/flyers/download-all', async (req, res) => {
       report,
     });
   } catch (err: any) {
-    console.error('[Flyers Download Error]:', err);
+    console.warn('[Flyers Download Error]:', err?.message || err);
+    const isDnsError =
+      err?.code === 'EAI_AGAIN' ||
+      err?.cause?.code === 'EAI_AGAIN' ||
+      String(err?.message).includes('EAI_AGAIN') ||
+      String(err?.cause?.message).includes('EAI_AGAIN');
+
+    const friendlyError = isDnsError
+      ? 'Instabilidade temporária de resolução DNS com o site do mercado. O servidor tentou reconectar 3 vezes mas o provedor demorou para responder. Por favor, tente clicar novamente.'
+      : `Erro ao identificar ou baixar panfletos: ${err.message}`;
+
     res.status(500).json({
       success: false,
-      error: `Erro ao identificar ou baixar panfletos: ${err.message}`,
+      error: friendlyError,
     });
   }
 });
@@ -1054,13 +1272,18 @@ app.post('/api/scrape-url', async (req, res) => {
   lastSourceUrl = targetUrl;
 
   try {
-    const response = await fetch(targetUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    const response = await fetchWithNetworkRetry(
+      targetUrl,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+        signal: AbortSignal.timeout(20000),
       },
-      signal: AbortSignal.timeout(15000),
-    });
+      3,
+      1000
+    );
 
     if (!response.ok) {
       return res.status(response.status).json({
@@ -1108,14 +1331,19 @@ app.post('/api/validar-url', async (req, res) => {
 
   const startTime = Date.now();
   try {
-    const response = await fetch(targetUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    const response = await fetchWithNetworkRetry(
+      targetUrl,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        },
+        signal: AbortSignal.timeout(20000),
       },
-      signal: AbortSignal.timeout(15000),
-    });
+      3,
+      1000
+    );
 
     if (!response.ok) {
       return res.json({
@@ -1233,7 +1461,6 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
 
   const candidateModels = [
     'gemini-3.8-flash',
-    'gemini-flash-latest',
     'gemini-3.1-flash-lite',
   ];
   let response: any = null;
@@ -1367,6 +1594,23 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
       } catch (err: any) {
         console.warn(`[Gemini Vision] Falha no modelo ${modelName} (tentativa ${attempts}):`, err.message);
         lastError = err;
+
+        const isDailyQuotaExhausted =
+          err?.status === 429 ||
+          err?.code === 429 ||
+          String(err?.message).includes('RESOURCE_EXHAUSTED') ||
+          String(err?.message).includes('free_tier_requests') ||
+          String(err?.message).includes('limit exceeded') ||
+          String(err?.message).includes('Quota exceeded');
+
+        if (isDailyQuotaExhausted) {
+          console.warn(
+            `[Gemini Vision] Cota diária gratuita do modelo ${modelName} esgotada. Pulando imediatamente para o modelo de contingência...`
+          );
+          // Não adianta repetir o mesmo modelo que já atingiu a cota diária
+          break;
+        }
+
         const is503OrRateLimit =
           err?.status === 503 ||
           err?.code === 503 ||
@@ -1391,6 +1635,33 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
   if (!response || !response.text) {
     const errorMsg = lastError?.message || 'Indisponível';
     const durationSec = Number(((Date.now() - startTime) / 1000).toFixed(1));
+
+    const isQuotaError =
+      lastError?.status === 429 ||
+      lastError?.code === 429 ||
+      String(lastError?.message).includes('RESOURCE_EXHAUSTED') ||
+      String(lastError?.message).includes('free_tier_requests') ||
+      String(lastError?.message).includes('Quota exceeded') ||
+      String(lastError?.message).includes('limit: 20');
+
+    if (isQuotaError) {
+      dbService.recordAiQuotaExhausted({
+        modelo: 'gemini-3.8-flash',
+        limite: 20,
+        detalhes: errorMsg,
+      });
+
+      return {
+        success: false,
+        items: [],
+        validade: '',
+        data_inicial: '',
+        data_final: '',
+        error:
+          'Cota diária gratuita do Gemini atingida (limite de 20 requisições/dia no Plano Gratuito). A cota diária é renovada automaticamente pelo Google às 00:00 UTC (21:00 BRT). Seus panfletos baixados continuam salvos e validados para extração.',
+      };
+    }
+
     dbService.recordAiCall({
       modelo: usedModel || 'gemini-3.8-flash',
       mercado: marketName,
@@ -1406,7 +1677,7 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
       validade: '',
       data_inicial: '',
       data_final: '',
-      error: `Os servidores do Gemini estão temporariamente sobrecarregados (503). Detalhes: ${errorMsg}`,
+      error: `Falha na leitura com Gemini Vision: ${errorMsg}`,
     };
   }
 
@@ -1437,7 +1708,7 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
           p.unidade_medida
         );
 
-        return {
+        const itemData = {
           id: `item-${pageNumber}-${Date.now()}-${idx}`,
           pageNumber,
           nome_mercado: p.nome_mercado || resolvedMercadoNome,
@@ -1445,9 +1716,9 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
           data_final: p.data_final || resolvedDataFinal,
           nome_produto: p.nome_produto,
           marca: p.marca || '',
-          quantidade_volume: p.quantidade_volume,
-          unidade_medida: p.unidade_medida,
-          preco_regular: Number(p.preco_regular),
+          quantidade_volume: Number(p.quantidade_volume) || 1,
+          unidade_medida: p.unidade_medida || 'unidade',
+          preco_regular: Number(p.preco_regular) || 0,
           preco_promocional:
             p.preco_promocional !== undefined && p.preco_promocional !== null
               ? Number(p.preco_promocional)
@@ -1457,6 +1728,13 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
           categoria: p.categoria || 'mercearia',
           preco_unitario_equivalente: equiv.valor,
           preco_unitario_label: equiv.label,
+        };
+
+        const chave_unica = generateProductCompositeKey(itemData);
+
+        return {
+          ...itemData,
+          chave_unica,
         };
       }
     );
@@ -1501,7 +1779,7 @@ REGRAS DE PRECISÃO ABSOLUTA (ZERO ALUCINAÇÃO):
   }
 }
 
-// Full automated pipeline: downloads flyers, extracts products via Gemini, and unlinks temporary flyer files on 100% verified extraction
+// Full automated pipeline: downloads flyers, checks processed cache, extracts products via Gemini, upserts with natural key, and unlinks temporary flyer files on 100% verified extraction
 export async function executeMarketAutomationPipeline(
   targetUrl: string,
   mercadoNome: string,
@@ -1518,15 +1796,81 @@ export async function executeMarketAutomationPipeline(
   console.log(`[Automação Pipeline] Iniciando ingestão para "${mercadoNome}" na URL: ${targetUrl}`);
 
   // 1. Download and validate all flyers for this market
-  const report = await executeFullFlyerDownloadAndAudit(targetUrl, mercadoNome);
+  let report: FlyerConferenceReport;
+  try {
+    report = await executeFullFlyerDownloadAndAudit(targetUrl, mercadoNome);
+  } catch (downloadErr: any) {
+    console.warn(`[Automação Pipeline] Falha ao acessar URL ${targetUrl} para "${mercadoNome}":`, downloadErr.message);
+    return {
+      success: false,
+      mercadoNome,
+      targetUrl,
+      panfletosBaixados: 0,
+      produtosExtraidos: 0,
+      panfletosExcluidos: 0,
+      detalhes: `Site do mercado temporariamente inacessível: ${downloadErr.message}`,
+    };
+  }
+
   const flyers = report.detalhes.filter((f) => f.status === 'sucesso' && f.validado);
 
-  console.log(`[Automação Pipeline] ${flyers.length} panfletos baixados com sucesso para "${mercadoNome}". Iniciando extração com Gemini Vision...`);
+  if (flyers.length === 0) {
+    console.warn(`[Automação Pipeline] Nenhum panfleto válido encontrado para download em "${mercadoNome}".`);
+    return {
+      success: false,
+      mercadoNome,
+      targetUrl,
+      panfletosBaixados: 0,
+      produtosExtraidos: 0,
+      panfletosExcluidos: 0,
+      detalhes: 'Nenhum panfleto válido encontrado na página do mercado.',
+    };
+  }
+
+  // 2. CHECK CACHE / DUPLICATE FLYER DETECTION (AI QUOTA PROTECTION)
+  const imageKeys = flyers.map((f) => path.basename(f.urlOrigem || f.fileName));
+  const validadeOfertas = report.validadeOfertas || '';
+  const encarteJaProcessado = dbService.isEncarteAlreadyProcessed(mercadoNome, validadeOfertas, imageKeys);
+
+  if (encarteJaProcessado) {
+    console.log(
+      `[Automação Pipeline] Encarte de "${mercadoNome}" (${validadeOfertas || 'vigência idêntica'}) já foi processado anteriormente em ${encarteJaProcessado.processado_em}. Pulando chamada da IA para proteger cota diária.`
+    );
+    // As ofertas já estão no catálogo persistido. Excluir os arquivos de imagem temporários baixados sem gastar IA
+    let limpos = 0;
+    for (const flyer of flyers) {
+      const filePath = path.join(DOWNLOADS_DIR, flyer.fileName);
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+          limpos++;
+        } catch {}
+      }
+    }
+    lastDownloadedFlyers = lastDownloadedFlyers.filter((f) => !flyers.some((fl) => fl.fileName === f.fileName));
+
+    return {
+      success: true,
+      mercadoNome,
+      targetUrl,
+      panfletosBaixados: flyers.length,
+      produtosExtraidos: 0,
+      panfletosExcluidos: limpos,
+      detalhes: `Encarte já processado em ${encarteJaProcessado.processado_em} (${encarteJaProcessado.total_produtos} produtos no catálogo). 0 chamadas IA gastas (cota 100% protegida). ${limpos} panfletos temporários limpos do disco.`,
+    };
+  }
+
+  console.log(
+    `[Automação Pipeline] ${flyers.length} panfletos baixados com sucesso para "${mercadoNome}". Iniciando extração com Gemini Vision...`
+  );
 
   let totalProdutosExtraidos = 0;
   let totalPanfletosExcluidos = 0;
+  let novosInseridosTotal = 0;
+  let duplicadosEvitadosTotal = 0;
+  let atualizadosTotal = 0;
 
-  // 2. Extract products from each downloaded flyer sequentially
+  // 3. Extract products from each downloaded flyer sequentially
   for (const flyer of flyers) {
     const filePath = path.join(DOWNLOADS_DIR, flyer.fileName);
     if (!fs.existsSync(filePath)) {
@@ -1546,9 +1890,14 @@ export async function executeMarketAutomationPipeline(
       });
 
       if (extractionRes.success && extractionRes.items.length > 0) {
-        // Append items to shared currentExtractedItems
-        currentExtractedItems = [...currentExtractedItems, ...extractionRes.items];
+        // Upsert to persistent DB with natural unique key deduplication
+        const upsertRes = dbService.upsertProdutos(extractionRes.items as ExtractedProductModel[]);
+        currentExtractedItems = dbService.getProdutosExtraidos();
+
         totalProdutosExtraidos += extractionRes.items.length;
+        novosInseridosTotal += upsertRes.novosInseridos;
+        duplicadosEvitadosTotal += upsertRes.duplicadosEvitados;
+        atualizadosTotal += upsertRes.atualizados;
 
         lastExtractionMetadata = {
           validade: extractionRes.validade || lastExtractionMetadata.validade,
@@ -1557,12 +1906,14 @@ export async function executeMarketAutomationPipeline(
           totalItems: currentExtractedItems.length,
         };
 
-        // 3. Excluir o panfleto do disco somente após confirmar extração dos produtos com sucesso (100% de cada encarte)
+        // 4. Excluir o panfleto do disco somente após confirmar extração dos produtos com sucesso (100% de cada encarte)
         try {
           if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
             totalPanfletosExcluidos++;
-            console.log(`[Automação] Panfleto ${flyer.fileName} excluído do disco após extração confirmada de ${extractionRes.items.length} produtos.`);
+            console.log(
+              `[Automação] Panfleto ${flyer.fileName} excluído do disco após extração confirmada de ${extractionRes.items.length} produtos.`
+            );
           }
           lastDownloadedFlyers = lastDownloadedFlyers.filter((f) => f.fileName !== flyer.fileName);
           if (lastConferenceReport && lastConferenceReport.detalhes) {
@@ -1572,6 +1923,17 @@ export async function executeMarketAutomationPipeline(
           console.warn(`[Automação] Erro ao excluir panfleto ${flyer.fileName}:`, delErr);
         }
       } else {
+        const isQuota =
+          extractionRes.error?.includes('Cota diária') ||
+          extractionRes.error?.includes('20 requisições') ||
+          extractionRes.error?.includes('RESOURCE_EXHAUSTED') ||
+          extractionRes.error?.includes('Quota exceeded');
+        if (isQuota) {
+          console.warn(
+            `[Automação] Cota diária gratuita do Gemini esgotada na página ${flyer.pageNumber}. Interrompendo extração dos panfletos seguintes. Todos os panfletos já baixados continuam salvos com segurança em disco.`
+          );
+          break;
+        }
         console.warn(`[Automação] Panfleto ${flyer.fileName} não gerou produtos ou falhou. Mantendo arquivo para auditoria.`);
       }
     } catch (pageErr: any) {
@@ -1579,7 +1941,19 @@ export async function executeMarketAutomationPipeline(
     }
   }
 
-  const detalhes = `Baixados: ${report.panfletosBaixados}/${report.panfletosEncontrados} | Extraídos: ${totalProdutosExtraidos} produtos | Panfletos excluídos: ${totalPanfletosExcluidos}`;
+  // 5. Registrar encarte no cache para nunca repetir extração desnecessária da mesma vigência
+  if (totalProdutosExtraidos > 0) {
+    dbService.recordEncarteProcessado({
+      mercado_nome: mercadoNome,
+      url_origem: targetUrl,
+      validade: report.validadeOfertas || '',
+      chaves_imagens: imageKeys,
+      total_produtos: totalProdutosExtraidos,
+    });
+    console.log(`[Automação Pipeline] Encarte de "${mercadoNome}" registrado no cache de encartes processados com sucesso.`);
+  }
+
+  const detalhes = `Baixados: ${report.panfletosBaixados}/${report.panfletosEncontrados} | Extraídos: ${totalProdutosExtraidos} produtos (${novosInseridosTotal} novos, ${duplicadosEvitadosTotal} duplicados prevenidos) | Panfletos excluídos: ${totalPanfletosExcluidos}`;
 
   return {
     success: report.panfletosBaixados > 0,
@@ -1636,15 +2010,24 @@ async function extractFlyerStrictHandler(req: any, res: any) {
     });
 
     if (!extractionResult.success) {
-      return res.status(503).json({
+      const isQuota =
+        extractionResult.error?.includes('Cota diária') ||
+        extractionResult.error?.includes('20 requisições') ||
+        extractionResult.error?.includes('RESOURCE_EXHAUSTED') ||
+        extractionResult.error?.includes('Quota exceeded');
+      return res.status(isQuota ? 429 : 503).json({
+        success: false,
+        isQuotaExhausted: isQuota,
         error: extractionResult.error || 'Erro ao processar imagem no Gemini Vision.',
       });
     }
 
     const formattedItems = extractionResult.items;
 
-    // Append to current extraction state
-    currentExtractedItems = [...currentExtractedItems, ...formattedItems];
+    // Intelligent Upsert: evita duplicação factual
+    const upsertRes = dbService.upsertProdutos(formattedItems as ExtractedProductModel[]);
+    currentExtractedItems = dbService.getProdutosExtraidos();
+
     lastExtractionMetadata = {
       validade: extractionResult.validade || lastExtractionMetadata.validade,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
@@ -1654,14 +2037,20 @@ async function extractFlyerStrictHandler(req: any, res: any) {
 
     // Safe auto-deletion of flyer only after verified successful extraction of products
     let flyerDeleted = false;
-    const targetFileName = flyerFileName || (req.body.pageNumber ? lastDownloadedFlyers.find(f => f.pageNumber === Number(req.body.pageNumber))?.fileName : null);
+    const targetFileName =
+      flyerFileName ||
+      (req.body.pageNumber
+        ? lastDownloadedFlyers.find((f) => f.pageNumber === Number(req.body.pageNumber))?.fileName
+        : null);
     if (deleteFlyerOnSuccess && targetFileName && formattedItems.length > 0) {
       try {
         const targetPath = path.join(DOWNLOADS_DIR, targetFileName);
         if (fs.existsSync(targetPath)) {
           fs.unlinkSync(targetPath);
           flyerDeleted = true;
-          console.log(`[Extrator] Panfleto ${targetFileName} (Pág. ${pageNumber}) excluído com sucesso após extração confirmada de ${formattedItems.length} produtos.`);
+          console.log(
+            `[Extrator] Panfleto ${targetFileName} (Pág. ${pageNumber}) excluído com sucesso após extração confirmada de ${formattedItems.length} produtos.`
+          );
         }
         lastDownloadedFlyers = lastDownloadedFlyers.filter((f) => f.fileName !== targetFileName);
         if (lastConferenceReport && lastConferenceReport.detalhes) {
@@ -1681,6 +2070,9 @@ async function extractFlyerStrictHandler(req: any, res: any) {
       data_final: extractionResult.data_final,
       pageNumber,
       extractedCountThisPage: formattedItems.length,
+      novosInseridos: upsertRes.novosInseridos,
+      duplicadosEvitados: upsertRes.duplicadosEvitados,
+      atualizados: upsertRes.atualizados,
       totalAccumulatedItems: currentExtractedItems.length,
       items: formattedItems,
       allCurrentItems: currentExtractedItems,
@@ -1761,24 +2153,56 @@ app.post('/api/flyers/extract-all-pages', async (req, res) => {
   });
 });
 
-// Direct bulk save or set verified items
+// Direct bulk save or set verified items with upsert & composite key
 app.post('/api/set-extracted-items', (req, res) => {
   const { items, validade } = req.body;
   if (Array.isArray(items)) {
     const dates = parseValidityDates(validade || '23/10 a 29/10/2026');
-    currentExtractedItems = items.map((it: any, idx: number) => ({
-      ...it,
-      id: it.id || `item-restored-${Date.now()}-${idx}`,
-      nome_mercado: it.nome_mercado || 'Abimar Supermercados',
-      data_inicial: it.data_inicial || dates.dataInicial || '23/10/2026',
-      data_final: it.data_final || dates.dataFinal || '29/10/2026',
-    }));
+    const formatted: ExtractedProductModel[] = items.map((it: any, idx: number) => {
+      const itemData = {
+        id: it.id || `item-restored-${Date.now()}-${idx}`,
+        pageNumber: it.pageNumber || 1,
+        nome_mercado: it.nome_mercado || 'Abimar Supermercados',
+        data_inicial: it.data_inicial || dates.dataInicial || '23/10/2026',
+        data_final: it.data_final || dates.dataFinal || '29/10/2026',
+        nome_produto: it.nome_produto || 'Produto',
+        marca: it.marca || '',
+        quantidade_volume: Number(it.quantidade_volume) || 1,
+        unidade_medida: it.unidade_medida || 'unidade',
+        preco_regular: Number(it.preco_regular) || 0,
+        preco_promocional:
+          it.preco_promocional !== undefined && it.preco_promocional !== null
+            ? Number(it.preco_promocional)
+            : null,
+        tipo_promocao: it.tipo_promocao || 'SEM_PROMOCAO',
+        condicao_detalhes: it.condicao_detalhes || null,
+        categoria: it.categoria || 'mercearia',
+        preco_unitario_equivalente: Number(it.preco_unitario_equivalente) || Number(it.preco_regular) || 0,
+        preco_unitario_label: it.preco_unitario_label || `R$ ${it.preco_regular} / un`,
+      };
+      return {
+        ...itemData,
+        chave_unica: it.chave_unica || generateProductCompositeKey(itemData),
+      };
+    });
+
+    const upsertRes = dbService.upsertProdutos(formatted);
+    currentExtractedItems = dbService.getProdutosExtraidos();
+
     lastExtractionMetadata = {
       validade: validade || 'Válidas de 23/10 a 29/10/2026',
       timestamp: new Date().toLocaleTimeString(),
       totalPages: 1,
       totalItems: currentExtractedItems.length,
     };
+
+    return res.json({
+      success: true,
+      count: currentExtractedItems.length,
+      novosInseridos: upsertRes.novosInseridos,
+      duplicadosEvitados: upsertRes.duplicadosEvitados,
+      atualizados: upsertRes.atualizados,
+    });
   }
   res.json({ success: true, count: currentExtractedItems.length });
 });
@@ -1791,7 +2215,7 @@ async function startServer() {
 
   if (isDev) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);

@@ -57,6 +57,35 @@
           "atualizado_em": "2026-10-31T13:30:00.000Z"
         }
       ]
+    },
+    {
+      "id": "f81734bc-045a-4933-bf9c-85124091a123",
+      "nome": "Fort Atacadista",
+      "ativo": true,
+      "regras_extracao_ia": {
+        "versao_motor": "1.0",
+        "mercado": "Fort Atacadista",
+        "vigencia": "Extrair obrigatoriamente a data inicial e data final de vigência contidas no encarte ou título da campanha e preencher os campos data_inicial e data_final de cada produto.",
+        "regras_especificas": [
+          "Preencher o campo nome_mercado obrigatoriamente com 'Fort Atacadista'.",
+          "Registrar preco_promocional com desconto exclusivo Vuon Card quando houver.",
+          "Identificar data de vigência e registrar data_inicial e data_final em todos os produtos.",
+          "Precisão factual 100% sem alucinações de produtos ou valores."
+        ]
+      },
+      "criado_em": "2026-11-05T03:30:00.000Z",
+      "atualizado_em": "2026-11-05T03:30:00.000Z",
+      "urls": [
+        {
+          "id": "c71829a1-8314-419b-a012-781928341901",
+          "mercado_id": "f81734bc-045a-4933-bf9c-85124091a123",
+          "descricao": "Encartes e Ofertas Araranguá (Loja 485)",
+          "url": "https://www.fortatacadista.com.br/encartes/sc/ararangua/ararangua-485",
+          "ativo": true,
+          "criado_em": "2026-11-05T03:30:00.000Z",
+          "atualizado_em": "2026-11-05T03:30:00.000Z"
+        }
+      ]
     }
   ],
   "configuracao_rotina": {
@@ -76,17 +105,20 @@
     "atualizado_em": "2026-10-31T13:30:00.000Z"
   },
   "ia_uso": {
-    "limite_diario_requisicoes": 1500,
+    "limite_diario_requisicoes": 20,
     "limite_rpm": 15,
     "modelo_ativo": "gemini-3.8-flash",
-    "plano_nome": "Gratuito (Google AI Studio - 1.500 RPD)",
-    "data_referencia": "2026-10-31",
+    "plano_nome": "Gratuito (Google AI Studio - 20 RPD)",
+    "data_referencia": "2026-11-05",
     "requisicoes_hoje": 0,
     "requisicoes_sucesso": 0,
     "requisicoes_falhas": 0,
     "total_paginas_extraidas_hoje": 0,
     "total_produtos_extraidos_hoje": 0,
     "ultima_requisicao": null,
-    "historico_recente": []
-  }
+    "historico_recente": [],
+    "cota_esgotada_hoje": false,
+    "mensagem_cota": null
+  },
+  "produtos_extraidos": []
 }

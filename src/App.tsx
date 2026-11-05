@@ -30,6 +30,7 @@ import AiUsageCard from './components/AiUsageCard.tsx';
 
 export interface ExtractedProduct {
   id: string;
+  chave_unica?: string;
   pageNumber: number;
   nome_mercado: string;
   data_inicial: string;
@@ -196,9 +197,15 @@ export default function App() {
         );
       }
     } catch (err: any) {
-      console.error(err);
+      console.warn('[Download Panfletos]', err?.message || err);
       setStatusType('error');
-      setStatusMessage(err.message || 'Erro ao baixar panfletos');
+      const msg = err?.message || 'Erro ao baixar panfletos';
+      const isDns = msg.includes('EAI_AGAIN') || msg.includes('fetch failed');
+      setStatusMessage(
+        isDns
+          ? 'Instabilidade temporária de rede ou DNS com o site do mercado. O servidor tentou reconectar automaticamente. Por favor, tente clicar novamente.'
+          : msg
+      );
     } finally {
       setIsDownloadingFlyers(false);
       setDownloadStepMessage('');
@@ -219,11 +226,31 @@ export default function App() {
         body: JSON.stringify({ pageNumber }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erro na extração');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const isQuota =
+          res.status === 429 ||
+          data?.isQuotaExhausted ||
+          String(data?.error).includes('Cota diária') ||
+          String(data?.error).includes('20 requisições') ||
+          String(data?.error).includes('RESOURCE_EXHAUSTED');
+
+        if (isQuota) {
+          setStatusType('warning');
+          setStatusMessage(
+            `Cota diária gratuita do Gemini atingida (limite de 20 requisições/dia). O panfleto da Página ${pageNumber} permanece 100% salvo em disco sem perdas. A cota renova às 21:00 BRT.`
+          );
+          return;
+        }
+        throw new Error(data.error || 'Erro na extração');
+      }
 
       const newItems: ExtractedProduct[] = data.items || [];
-      const updated = appendMode ? [...extractedProducts, ...newItems] : newItems;
+      const updated = data.allCurrentItems && Array.isArray(data.allCurrentItems)
+        ? data.allCurrentItems
+        : appendMode
+        ? [...extractedProducts, ...newItems]
+        : newItems;
 
       setExtractedProducts(updated);
       setMetadata({
@@ -237,13 +264,33 @@ export default function App() {
         setDownloadedFlyers((prev) => prev.filter((f) => f.pageNumber !== pageNumber));
       }
 
+      const novos = data.novosInseridos !== undefined ? data.novosInseridos : newItems.length;
+      const dup = data.duplicadosEvitados !== undefined ? data.duplicadosEvitados : 0;
+      const att = data.atualizados !== undefined ? data.atualizados : 0;
+      const dedupNotice =
+        dup > 0
+          ? ` (${novos} novos adicionados, ${dup} duplicados prevenidos${att > 0 ? `, ${att} preços atualizados` : ''})`
+          : '';
+
       setStatusType('success');
       setStatusMessage(
-        `Página ${pageNumber} transcrita com sucesso! Extraídos ${newItems.length} produtos reais (via ${data.usedModel || 'Gemini'}). O panfleto foi excluído do servidor com segurança.`
+        `Página ${pageNumber} transcrita com sucesso! Extraídos ${newItems.length} produtos reais${dedupNotice} (via ${data.usedModel || 'Gemini'}). O panfleto foi excluído do servidor com segurança.`
       );
     } catch (err: any) {
-      setStatusType('error');
-      setStatusMessage(err.message || 'Falha ao extrair produtos');
+      const msg = err.message || 'Falha ao extrair produtos';
+      const isQuota =
+        msg.includes('Cota diária') ||
+        msg.includes('20 requisições') ||
+        msg.includes('RESOURCE_EXHAUSTED');
+      if (isQuota) {
+        setStatusType('warning');
+        setStatusMessage(
+          'Cota diária gratuita do Gemini atingida (20 reqs/dia). Seus panfletos baixados continuam salvos no disco.'
+        );
+      } else {
+        setStatusType('error');
+        setStatusMessage(msg);
+      }
     } finally {
       setIsExtractingAI(false);
       setExtractingPageNumber(null);
@@ -258,8 +305,9 @@ export default function App() {
     setStatusType('info');
     setStatusMessage(`Iniciando extração em lote dos ${downloadedFlyers.length} panfletos baixados...`);
 
+    let quotaExhaustedEncountered = false;
+
     try {
-      let currentList = appendMode ? [...extractedProducts] : [];
       const flyersToProcess = [...downloadedFlyers];
 
       for (let i = 0; i < flyersToProcess.length; i++) {
@@ -274,26 +322,54 @@ export default function App() {
           body: JSON.stringify({ pageNumber: flyer.pageNumber }),
         });
 
-        if (res.ok) {
-          const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+
+        if (res.ok && data.success) {
           const pageItems: ExtractedProduct[] = data.items || [];
-          currentList = [...currentList, ...pageItems];
-          setExtractedProducts([...currentList]);
+          if (data.allCurrentItems && Array.isArray(data.allCurrentItems)) {
+            setExtractedProducts(data.allCurrentItems);
+          }
 
           // Confirmed extraction: remove this flyer from local state
           if (data.flyerDeleted || pageItems.length > 0) {
             setDownloadedFlyers((prev) => prev.filter((f) => f.pageNumber !== flyer.pageNumber));
           }
+        } else {
+          const isQuota =
+            res.status === 429 ||
+            data?.isQuotaExhausted ||
+            String(data?.error).includes('Cota diária') ||
+            String(data?.error).includes('20 requisições') ||
+            String(data?.error).includes('RESOURCE_EXHAUSTED');
+
+          if (isQuota) {
+            quotaExhaustedEncountered = true;
+            setStatusType('warning');
+            setStatusMessage(
+              `Cota diária gratuita do Gemini atingida na Página ${flyer.pageNumber}. Os panfletos restantes continuam 100% salvos e íntegros em disco para extração quando a cota renovar às 21:00 BRT.`
+            );
+            break; // Stop loop immediately to avoid repeating 429 errors!
+          }
         }
       }
 
-      setStatusType('success');
-      setStatusMessage(
-        `Extração de todos os panfletos concluída! Total de ${currentList.length} produtos catalogados e panfletos excluídos do servidor com segurança.`
-      );
+      // Refresh final persisted and deduplicated catalog
+      const refRes = await fetch('/api/extracted-products');
+      if (refRes.ok) {
+        const refData = await refRes.json();
+        setExtractedProducts(refData.items || []);
+        if (!quotaExhaustedEncountered) {
+          setStatusType('success');
+          setStatusMessage(
+            `Extração em lote concluída com sucesso! Total de ${refData.items?.length || 0} produtos consolidados sem duplicatas (chave única ativa) e panfletos temporários limpos do disco.`
+          );
+        }
+      }
     } catch (err: any) {
-      setStatusType('error');
-      setStatusMessage(err.message || 'Erro durante extração');
+      if (!quotaExhaustedEncountered) {
+        setStatusType('error');
+        setStatusMessage(err.message || 'Erro durante extração');
+      }
     } finally {
       setIsExtractingAI(false);
     }
@@ -1078,6 +1154,17 @@ ${conferenceReport.detalhes
                         </td>
                         <td className="py-3 px-4">
                           <div className="font-bold text-slate-900 text-sm">{item.nome_produto}</div>
+                          {item.chave_unica && (
+                            <div
+                              className="text-[10px] font-mono text-slate-400 hover:text-slate-600 truncate max-w-xs flex items-center gap-1 mt-0.5"
+                              title={`Chave Única Antiduplicação: ${item.chave_unica}`}
+                            >
+                              <span className="text-[9px] px-1 py-0.2 bg-slate-100 text-slate-500 rounded font-semibold border border-slate-200">
+                                CHAVE
+                              </span>
+                              <span className="truncate">{item.chave_unica}</span>
+                            </div>
+                          )}
                         </td>
                         <td className="py-3 px-3 font-semibold text-slate-700">
                           {item.marca || <span className="text-slate-400 font-normal">—</span>}

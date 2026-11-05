@@ -49,7 +49,7 @@ export interface AiRecentCall {
 }
 
 export interface AiUsageModel {
-  limite_diario_requisicoes: number; // Padrão 1500 (Free tier do Gemini 3.8 Flash)
+  limite_diario_requisicoes: number; // 20 RPD no Free Tier do Google AI Studio para Gemini 3.8 Flash
   limite_rpm: number; // 15 RPM
   modelo_ativo: string;
   plano_nome: string;
@@ -60,6 +60,8 @@ export interface AiUsageModel {
   total_paginas_extraidas_hoje: number;
   total_produtos_extraidos_hoje: number;
   ultima_requisicao: string | null;
+  cota_esgotada_hoje?: boolean;
+  mensagem_cota?: string | null;
   historico_recente: AiRecentCall[];
 }
 
@@ -69,10 +71,95 @@ export interface AiUsageReport extends AiUsageModel {
   tempo_ate_reset: string;
 }
 
+export interface ExtractedProductModel {
+  id: string;
+  chave_unica: string; // Ex: abimar_arroz_parboilizado_tipo_1_tio_joao_5_kg_23102026_29102026
+  pageNumber: number;
+  nome_mercado: string;
+  data_inicial: string;
+  data_final: string;
+  nome_produto: string;
+  marca: string;
+  quantidade_volume: number;
+  unidade_medida: string;
+  preco_regular: number;
+  preco_promocional: number | null;
+  tipo_promocao: string;
+  condicao_detalhes: string | null;
+  categoria: string;
+  preco_unitario_equivalente: number;
+  preco_unitario_label: string;
+  criado_em?: string;
+  atualizado_em?: string;
+}
+
+export interface EncarteProcessadoModel {
+  id: string;
+  mercado_nome: string;
+  url_origem: string;
+  validade: string;
+  chaves_imagens: string[];
+  total_produtos: number;
+  processado_em: string;
+}
+
+export interface UpsertResult {
+  updatedList: ExtractedProductModel[];
+  novosInseridos: number;
+  duplicadosEvitados: number;
+  atualizados: number;
+}
+
+// Normalizador de texto para chaves únicas livres de acentos e caracteres especiais
+export function normalizeKeyText(str: string | null | undefined): string {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+// Gerador da Chave Única Composta (Natural Key) para prevenção factual de duplicação
+export function generateProductCompositeKey(item: {
+  nome_mercado: string;
+  nome_produto: string;
+  marca?: string | null;
+  quantidade_volume: number;
+  unidade_medida: string;
+  data_inicial: string;
+  data_final: string;
+  tipo_promocao?: string | null;
+}): string {
+  const mercado = normalizeKeyText(item.nome_mercado || 'mercado');
+  const produto = normalizeKeyText(item.nome_produto || 'produto');
+  const marca = normalizeKeyText(item.marca || '');
+  const volNum = Number(item.quantidade_volume) || 1;
+  const volStr = String(volNum).replace('.', '_');
+  const unid = normalizeKeyText(item.unidade_medida || 'un');
+  const dtIni = (item.data_inicial || '').replace(/\D/g, '');
+  const dtFim = (item.data_final || '').replace(/\D/g, '');
+  const tipo = normalizeKeyText(item.tipo_promocao || 'sem_promocao');
+
+  const parts = [
+    mercado,
+    produto,
+    marca ? marca : null,
+    `${volStr}_${unid}`,
+    dtIni && dtFim ? `${dtIni}_${dtFim}` : null,
+    tipo && tipo !== 'sem_promocao' ? tipo : null,
+  ].filter(Boolean);
+
+  return parts.join('_');
+}
+
 interface DatabaseSchema {
   mercados: MercadoModel[];
   configuracao_rotina: ConfiguracaoRotinaModel;
   ia_uso?: AiUsageModel;
+  produtos_extraidos?: ExtractedProductModel[];
+  encartes_processados?: EncarteProcessadoModel[];
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -368,10 +455,10 @@ class Database {
     const today = new Date().toISOString().split('T')[0];
     if (!this.data.ia_uso) {
       this.data.ia_uso = {
-        limite_diario_requisicoes: 1500,
+        limite_diario_requisicoes: 20,
         limite_rpm: 15,
         modelo_ativo: 'gemini-3.8-flash',
-        plano_nome: 'Gratuito (Google AI Studio - 1.500 RPD)',
+        plano_nome: 'Gratuito (Google AI Studio - 20 RPD)',
         data_referencia: today,
         requisicoes_hoje: 0,
         requisicoes_sucesso: 0,
@@ -379,8 +466,17 @@ class Database {
         total_paginas_extraidas_hoje: 0,
         total_produtos_extraidos_hoje: 0,
         ultima_requisicao: null,
+        cota_esgotada_hoje: false,
+        mensagem_cota: null,
         historico_recente: [],
       };
+      this.save();
+    }
+
+    // Se o limite armazenado ainda for o antigo 1500 fictício, atualiza para 20 RPD real
+    if (this.data.ia_uso.limite_diario_requisicoes === 1500) {
+      this.data.ia_uso.limite_diario_requisicoes = 20;
+      this.data.ia_uso.plano_nome = 'Gratuito (Google AI Studio - 20 RPD)';
       this.save();
     }
 
@@ -392,15 +488,17 @@ class Database {
       this.data.ia_uso.requisicoes_falhas = 0;
       this.data.ia_uso.total_paginas_extraidas_hoje = 0;
       this.data.ia_uso.total_produtos_extraidos_hoje = 0;
+      this.data.ia_uso.cota_esgotada_hoje = false;
+      this.data.ia_uso.mensagem_cota = null;
       this.save();
     }
 
     const current = this.data.ia_uso;
-    const limite = current.limite_diario_requisicoes || 1500;
+    const limite = current.limite_diario_requisicoes || 20;
     const percentual = Number(((current.requisicoes_hoje / limite) * 100).toFixed(1));
     const restantes = Math.max(0, limite - current.requisicoes_hoje);
 
-    // Contagem regressiva até meia-noite (reset de cota diária)
+    // Contagem regressiva até meia-noite (reset de cota diária do Google)
     const now = new Date();
     const midnight = new Date(now);
     midnight.setHours(24, 0, 0, 0);
@@ -415,6 +513,25 @@ class Database {
       requisicoes_restantes: restantes,
       tempo_ate_reset,
     };
+  }
+
+  public recordAiQuotaExhausted(params: {
+    modelo: string;
+    limite?: number;
+    detalhes?: string;
+  }): AiUsageReport {
+    this.getAiUsage();
+    const current = this.data.ia_uso!;
+    const limite = params.limite || 20;
+    current.cota_esgotada_hoje = true;
+    current.limite_diario_requisicoes = limite;
+    current.requisicoes_hoje = Math.max(current.requisicoes_hoje, limite);
+    current.requisicoes_falhas += 1;
+    current.plano_nome = `Gratuito (Google AI Studio - ${limite} RPD)`;
+    current.mensagem_cota = `Limite de ${limite} requisições diárias gratuitas atingido para o modelo ${params.modelo}.`;
+    current.ultima_requisicao = new Date().toLocaleString('pt-BR');
+    this.save();
+    return this.getAiUsage();
   }
 
   public recordAiCall(params: {
@@ -477,6 +594,150 @@ class Database {
 
     this.save();
     return this.getAiUsage();
+  }
+
+  // --- PRODUTOS EXTRAÍDOS (UPSERT E DESDUPLICAÇÃO FACTUAL) ---
+  public getProdutosExtraidos(): ExtractedProductModel[] {
+    if (!this.data.produtos_extraidos) {
+      this.data.produtos_extraidos = [];
+    }
+    return this.data.produtos_extraidos;
+  }
+
+  public upsertProdutos(incomingList: ExtractedProductModel[]): UpsertResult {
+    if (!this.data.produtos_extraidos) {
+      this.data.produtos_extraidos = [];
+    }
+
+    const itemMap = new Map<string, ExtractedProductModel>();
+    for (const item of this.data.produtos_extraidos) {
+      const key = item.chave_unica || generateProductCompositeKey(item);
+      itemMap.set(key, { ...item, chave_unica: key });
+    }
+
+    let novosInseridos = 0;
+    let duplicadosEvitados = 0;
+    let atualizados = 0;
+    const now = new Date().toISOString();
+
+    for (const incoming of incomingList) {
+      const key = incoming.chave_unica || generateProductCompositeKey(incoming);
+      const existing = itemMap.get(key);
+
+      if (!existing) {
+        itemMap.set(key, {
+          ...incoming,
+          chave_unica: key,
+          criado_em: incoming.criado_em || now,
+          atualizado_em: now,
+        });
+        novosInseridos++;
+      } else {
+        duplicadosEvitados++;
+        const precoMudou =
+          existing.preco_regular !== incoming.preco_regular ||
+          existing.preco_promocional !== incoming.preco_promocional;
+
+        if (precoMudou) {
+          atualizados++;
+          itemMap.set(key, {
+            ...existing,
+            preco_regular: incoming.preco_regular,
+            preco_promocional: incoming.preco_promocional,
+            preco_unitario_equivalente: incoming.preco_unitario_equivalente,
+            preco_unitario_label: incoming.preco_unitario_label,
+            atualizado_em: now,
+          });
+        }
+      }
+    }
+
+    this.data.produtos_extraidos = Array.from(itemMap.values());
+    this.save();
+
+    return {
+      updatedList: this.data.produtos_extraidos,
+      novosInseridos,
+      duplicadosEvitados,
+      atualizados,
+    };
+  }
+
+  public deleteProduto(id: string): boolean {
+    if (!this.data.produtos_extraidos) return false;
+    const initialLen = this.data.produtos_extraidos.length;
+    this.data.produtos_extraidos = this.data.produtos_extraidos.filter((p) => p.id !== id);
+    if (this.data.produtos_extraidos.length !== initialLen) {
+      this.save();
+      return true;
+    }
+    return false;
+  }
+
+  public clearProdutos(): void {
+    this.data.produtos_extraidos = [];
+    this.save();
+  }
+
+  // --- CONTROLE DE ENCARTES PROCESSADOS (PROTEÇÃO DE COTA IA) ---
+  public isEncarteAlreadyProcessed(
+    mercadoNome: string,
+    validade: string,
+    chavesImagens: string[]
+  ): EncarteProcessadoModel | null {
+    if (!this.data.encartes_processados || chavesImagens.length === 0) {
+      return null;
+    }
+
+    const normMercado = normalizeKeyText(mercadoNome);
+    const normValidade = normalizeKeyText(validade);
+
+    const match = this.data.encartes_processados.find((enc) => {
+      if (normalizeKeyText(enc.mercado_nome) !== normMercado) return false;
+      // Se tiver a mesma vigência identificada
+      if (normValidade && normValidade !== 'ofertas_validas_no_encarte' && normalizeKeyText(enc.validade) === normValidade) {
+        return true;
+      }
+      // Ou se todas as imagens encontradas na página atual já foram processadas
+      const todasContidas = chavesImagens.length > 0 && chavesImagens.every((img) => enc.chaves_imagens.includes(img));
+      return todasContidas;
+    });
+
+    return match || null;
+  }
+
+  public recordEncarteProcessado(encarte: {
+    mercado_nome: string;
+    url_origem: string;
+    validade: string;
+    chaves_imagens: string[];
+    total_produtos: number;
+  }): void {
+    if (!this.data.encartes_processados) {
+      this.data.encartes_processados = [];
+    }
+
+    const novo: EncarteProcessadoModel = {
+      id: crypto.randomUUID(),
+      mercado_nome: encarte.mercado_nome,
+      url_origem: encarte.url_origem,
+      validade: encarte.validade || 'Ofertas válidas no encarte',
+      chaves_imagens: encarte.chaves_imagens,
+      total_produtos: encarte.total_produtos,
+      processado_em: new Date().toLocaleString('pt-BR'),
+    };
+
+    // Remove registro antigo do mesmo mercado e mesma vigência se houver
+    this.data.encartes_processados = [
+      novo,
+      ...this.data.encartes_processados.filter(
+        (e) =>
+          normalizeKeyText(e.mercado_nome) !== normalizeKeyText(encarte.mercado_nome) ||
+          normalizeKeyText(e.validade) !== normalizeKeyText(encarte.validade)
+      ),
+    ].slice(0, 50);
+
+    this.save();
   }
 }
 

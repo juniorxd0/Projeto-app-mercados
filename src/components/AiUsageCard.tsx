@@ -40,6 +40,8 @@ export interface AiUsageData {
   total_paginas_extraidas_hoje: number;
   total_produtos_extraidos_hoje: number;
   ultima_requisicao: string | null;
+  cota_esgotada_hoje?: boolean;
+  mensagem_cota?: string | null;
   historico_recente: AiRecentCall[];
   percentual_usado: number;
   requisicoes_restantes: number;
@@ -56,30 +58,43 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [isEditingLimits, setIsEditingLimits] = useState<boolean>(false);
-  const [customDailyLimit, setCustomDailyLimit] = useState<number>(1500);
+  const [customDailyLimit, setCustomDailyLimit] = useState<number>(20);
   const [customRpm, setCustomRpm] = useState<number>(15);
-  const [customPlanName, setCustomPlanName] = useState<string>('Gratuito (Google AI Studio - 1.500 RPD)');
+  const [customPlanName, setCustomPlanName] = useState<string>('Gratuito (Google AI Studio - 20 RPD)');
   const [isSavingLimits, setIsSavingLimits] = useState<boolean>(false);
   const [saveSuccessMsg, setSaveSuccessMsg] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState<boolean>(false);
 
   const fetchUsage = async (silent = false) => {
     if (!silent) setIsLoading(true);
-    try {
-      const res = await fetch('/api/ia/uso');
-      const data = await res.json();
-      if (res.ok && data.success && data.usage) {
-        setUsage(data.usage);
-        setCustomDailyLimit(data.usage.limite_diario_requisicoes || 1500);
-        setCustomRpm(data.usage.limite_rpm || 15);
-        setCustomPlanName(data.usage.plano_nome || 'Gratuito (Google AI Studio - 1.500 RPD)');
+    let attempts = 0;
+    const maxAttempts = 2;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        const res = await fetch('/api/ia/uso');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && data.usage) {
+            setUsage(data.usage);
+            setCustomDailyLimit(data.usage.limite_diario_requisicoes || 20);
+            setCustomRpm(data.usage.limite_rpm || 15);
+            setCustomPlanName(data.usage.plano_nome || 'Gratuito (Google AI Studio - 20 RPD)');
+            break;
+          }
+        }
+      } catch (err) {
+        if (attempts < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 800));
+        } else {
+          console.warn('Serviço de métricas de IA temporariamente indisponível no momento:', err);
+        }
       }
-    } catch (err) {
-      console.error('Falha ao carregar dados de uso da IA:', err);
-    } finally {
-      if (!silent) setIsLoading(false);
-      setIsRefreshing(false);
     }
+
+    if (!silent) setIsLoading(false);
+    setIsRefreshing(false);
   };
 
   useEffect(() => {
@@ -95,6 +110,12 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
     setIsRefreshing(true);
     fetchUsage(true);
     if (onRefresh) onRefresh();
+  };
+
+  const applyPresetPlan = (rpd: number, rpm: number, nome: string) => {
+    setCustomDailyLimit(rpd);
+    setCustomRpm(rpm);
+    setCustomPlanName(nome);
   };
 
   const handleSaveLimits = async (e: React.FormEvent) => {
@@ -161,20 +182,28 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
   // Compact bar widget mode
   if (compact) {
     return (
-      <div className="bg-white rounded-xl border border-slate-200 p-2.5 shadow-2xs flex flex-wrap items-center justify-between gap-3 text-xs">
+      <div className={`rounded-xl border p-2.5 shadow-2xs flex flex-wrap items-center justify-between gap-3 text-xs ${
+        usage.cota_esgotada_hoje ? 'bg-amber-50/80 border-amber-300' : 'bg-white border-slate-200'
+      }`}>
         <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-emerald-100 text-emerald-800 flex items-center justify-center shrink-0">
-            <Cpu className="w-4 h-4" />
+          <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
+            usage.cota_esgotada_hoje ? 'bg-amber-200 text-amber-900' : 'bg-emerald-100 text-emerald-800'
+          }`}>
+            {usage.cota_esgotada_hoje ? <AlertCircle className="w-4 h-4 text-amber-700" /> : <Cpu className="w-4 h-4" />}
           </div>
           <div>
             <div className="flex items-center gap-1.5 font-bold text-slate-900">
               <span>IA: {usage.modelo_ativo}</span>
-              <span className={`text-[10px] font-black px-1.5 py-0.2 rounded border ${badgeColor}`}>
-                {percentual}% do limite diário
+              <span className={`text-[10px] font-black px-1.5 py-0.2 rounded border ${
+                usage.cota_esgotada_hoje ? 'text-amber-800 bg-amber-100 border-amber-300' : badgeColor
+              }`}>
+                {usage.cota_esgotada_hoje ? 'Cota Diária Esgotada' : `${percentual}% do limite diário`}
               </span>
             </div>
             <p className="text-[11px] text-slate-500">
-              {usage.requisicoes_hoje} de {usage.limite_diario_requisicoes.toLocaleString('pt-BR')} reqs usadas hoje ({usage.requisicoes_restantes.toLocaleString('pt-BR')} restantes)
+              {usage.cota_esgotada_hoje
+                ? `Limite diário do Free Tier atingido (${usage.requisicoes_hoje}/${usage.limite_diario_requisicoes} reqs). Reset em ${usage.tempo_ate_reset}`
+                : `${usage.requisicoes_hoje} de ${usage.limite_diario_requisicoes.toLocaleString('pt-BR')} reqs usadas hoje (${usage.requisicoes_restantes.toLocaleString('pt-BR')} restantes)`}
             </p>
           </div>
         </div>
@@ -182,7 +211,7 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
         <div className="flex items-center gap-3">
           <div className="w-32 sm:w-44 bg-slate-100 rounded-full h-2.5 overflow-hidden border border-slate-200">
             <div
-              className={`h-full rounded-full transition-all duration-500 ${progressColor}`}
+              className={`h-full rounded-full transition-all duration-500 ${usage.cota_esgotada_hoje ? 'bg-amber-500' : progressColor}`}
               style={{ width: `${Math.min(100, Math.max(2, percentual))}%` }}
             ></div>
           </div>
@@ -245,6 +274,28 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
           </button>
         </div>
       </div>
+
+      {/* Quota Exhausted Alert Banner */}
+      {usage.cota_esgotada_hoje && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl flex items-start gap-3 text-amber-900 shadow-2xs">
+          <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="space-y-1 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-black text-sm">Cota Diária Gratuita do Gemini Esgotada (20/20 requisições)</span>
+              <span className="bg-amber-200 text-amber-900 font-bold px-2 py-0.5 rounded text-[10px]">
+                Renovação em {usage.tempo_ate_reset} (21:00 BRT)
+              </span>
+            </div>
+            <p className="text-amber-800 leading-relaxed">
+              O modelo Gemini atingiu o limite de 20 requisições diárias (RPD) do plano gratuito. <strong>Todos os panfletos já baixados permanecem intactos e salvos no disco</strong>, prontos para a extração continuar sem perda de dados assim que a cota for renovada.
+            </p>
+            <div className="pt-1 text-[11px] text-amber-700 flex items-center gap-1.5">
+              <Info className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span>Dica: Caso utilize uma chave com plano pago ativado (Pay-as-you-go), clique em "Ajustar Limites" para definir o limite para 1.500 RPD.</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {saveSuccessMsg && (
         <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs font-bold flex items-center gap-2">
@@ -342,9 +393,28 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
       {/* Edit Limits Form Accordion */}
       {isEditingLimits && (
         <form onSubmit={handleSaveLimits} className="p-4 bg-purple-50/70 border border-purple-200 rounded-xl space-y-3">
-          <div className="flex items-center gap-2">
-            <Sliders className="w-4 h-4 text-purple-700" />
-            <span className="text-xs font-bold text-purple-900">Configurar Limites da Chave Gemini:</span>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Sliders className="w-4 h-4 text-purple-700" />
+              <span className="text-xs font-bold text-purple-900">Configurar Limites da Chave Gemini:</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-[11px] text-slate-500 font-medium">Predefinições:</span>
+              <button
+                type="button"
+                onClick={() => applyPresetPlan(20, 15, 'Gratuito (Google AI Studio - 20 RPD)')}
+                className="px-2 py-0.5 rounded bg-white hover:bg-purple-100 text-purple-800 text-[11px] font-bold border border-purple-300 transition-colors cursor-pointer"
+              >
+                Gratuito (20 RPD)
+              </button>
+              <button
+                type="button"
+                onClick={() => applyPresetPlan(1500, 15, 'Pay-as-you-go (1.500 RPD)')}
+                className="px-2 py-0.5 rounded bg-white hover:bg-purple-100 text-purple-800 text-[11px] font-bold border border-purple-300 transition-colors cursor-pointer"
+              >
+                Pay-as-you-go (1.500 RPD)
+              </button>
+            </div>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
@@ -353,13 +423,13 @@ export default function AiUsageCard({ compact = false, onRefresh }: AiUsageCardP
               </label>
               <input
                 type="number"
-                min="10"
+                min="5"
                 max="1000000"
                 value={customDailyLimit}
                 onChange={(e) => setCustomDailyLimit(Number(e.target.value))}
                 className="w-full bg-white border border-purple-300 rounded-lg px-3 py-1.5 text-xs font-bold text-slate-800 focus:outline-none focus:border-purple-600"
               />
-              <span className="text-[10px] text-slate-500">Padrão Gratuito: 1.500 req/dia</span>
+              <span className="text-[10px] text-slate-500">Padrão Gratuito: 20 req/dia</span>
             </div>
 
             <div>
